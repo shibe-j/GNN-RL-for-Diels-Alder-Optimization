@@ -1,0 +1,9 @@
+gymnasium[classic-control]
+git+https://github.com/chemgymrl/chemgymrl.git@main
+stable-baselines3
+torch
+torchvision
+torchaudio
+--extra-index-url https://download.pytorch.org/whl/cu121
+numpy
+stable-baselines3[extra]
