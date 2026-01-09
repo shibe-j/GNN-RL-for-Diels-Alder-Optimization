@@ -6,8 +6,8 @@ from chemistrylab.reactions.reaction_info import ReactInfo, REACTION_PATH
 from chemistrylab.reactions.reaction import Reaction
 from chemistrylab.lab.shelf import Shelf
 
-from ..reactions import REACTION_PATH
-from ..materials.but_and_acr_materials import Butadiene, Acrylonitrile, Cyanocyclohexene
+from chemgymrl.reactions import REACTION_PATH
+from chemgymrl.materials.but_and_acr_materials import Butadiene, Acrylonitrile, Cyanocyclohexene
 
 
 def get_mat(mat, amount, name=None):

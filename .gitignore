@@ -1,0 +1,41 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+# Windows
+Thumbs.db
+# Editors / IDEs
+.vscode/
+.idea/
+*.iml
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnp
+.pnp.js
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.env.*
+.venv/
+# Logs and reporting
+logs/
+*.log
+coverage/
+htmlcov/
+pytest_cache/
+# Build / packaging
+dist/
+build/
+*.egg-info/
+# Misc caches
+.cache/
+*.sqlite3
+.DS_Store
+.DS_Store

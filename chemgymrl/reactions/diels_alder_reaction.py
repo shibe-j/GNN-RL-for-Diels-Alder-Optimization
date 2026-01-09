@@ -3,7 +3,7 @@ from chemistrylab.reactions.reaction import Reaction
 from chemistrylab import material, vessel
 import numpy as np
 import json
-from ..materials.but_and_acr_materials import Butadiene, Acrylonitrile, Cyanocyclohexene
+from chemgymrl.materials.but_and_acr_materials import Butadiene, Acrylonitrile, Cyanocyclohexene
 
 
 r_info = ReactInfo(
