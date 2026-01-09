@@ -2,3 +2,4 @@
 from . import benches
 
 __all__ = ['benches']
+

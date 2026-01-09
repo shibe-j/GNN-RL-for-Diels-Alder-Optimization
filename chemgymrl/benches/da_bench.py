@@ -54,7 +54,7 @@ class DielsAlderReact_v0(GenBench):
 
         shelf = Shelf([
             get_mat("Butadiene", 1, "Reaction Vessel"),
-            get_mat("Acrylonitrile", 1,)
+            get_mat("Acrylonitrile", 1,"")
         ])
 
         actions = [
@@ -62,7 +62,7 @@ class DielsAlderReact_v0(GenBench):
             Action([1], [ContinuousParam(0, 1, 1e-3, ())], 'pour by percent', [0], 0.01, False),
         ]
 
-        react_info = ReactInfo.from_json(REACTION_PATH+"/diels_alder_reaction.py")
+        react_info = ReactInfo.from_json(REACTION_PATH+"/diels_alder.json")
         print("="*70)
         print("LOADED REACTION PARAMETERS:")
         print(f"Activation Energy: {float(react_info.activ_energy_arr):.1f} J/mol")
