@@ -51,16 +51,22 @@ class DielsAlderReact_v0(GenBench):
 
         #If you want to add a solvent put it into the default reaction vessel
         #in general and add reactants into it.
-
+    
         shelf = Shelf([
             get_mat("Butadiene", 1, "Reaction Vessel"),
             get_mat("Acrylonitrile", 1,"")
         ])
 
+        actions=[
+            Action([0], [ContinuousParam(298, 450, 0, (300,))], 'heat contact', [0], 0.01, False),
+            Action([1], [ContinuousParam(0, 1, 1e-3, ())], 'pour by percent', [0], 0.01, False),
+        ]
+        """
         actions = [
             Action([0], [ContinuousParam(298, 450, 0, (300,))], 'heat contact', [0], 0.01, False),
             Action([1], [ContinuousParam(0, 1, 1e-3, ())], 'pour by percent', [0], 0.01, False),
         ]
+        """
 
         react_info = ReactInfo.from_json(REACTION_PATH+"/diels_alder.json")
         print("="*70)
@@ -77,6 +83,7 @@ class DielsAlderReact_v0(GenBench):
             default_events=(Event("react", (Reaction(react_info),), None),),
             reward_function=base_rew,
             discrete=False,
+            #discrete=True,
             max_steps=20
         )
 
