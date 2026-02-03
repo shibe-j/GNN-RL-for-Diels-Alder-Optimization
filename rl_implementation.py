@@ -10,12 +10,18 @@ RDLogger.DisableLog('rdApp.warning')
 
 class DielsAlderSelectivityEnv(gym.Env):
     """
-    Custom Gymnasium environment for Diels–Alder selectivity.
+    Improved Custom Gymnasium environment for Diels–Alder selectivity.
+    
+    Key improvements:
+    - Better reward structure with positive rewards for good outcomes
+    - More predictable chemistry with clearer cause-effect
+    - Intermediate shaping rewards
+    - Longer episodes for better optimization
     """
 
     metadata = {"render_modes": []}
 
-    def __init__(self, seed=None, max_steps=10):
+    def __init__(self, seed=None, max_steps=20):
         super().__init__()
 
         # RNG
@@ -36,10 +42,10 @@ class DielsAlderSelectivityEnv(gym.Env):
 
         # Chemistry
         self.substituents = [
-            'C=CC#N',
-            'CC=CC#N',
-            'C(C#N)=CC#N',
-            'C(C(=O)N)=CC#N'
+            'C=CC#N',           # Simple EWG
+            'CC=CC#N',          # Methyl + EWG
+            'C(C#N)=CC#N',      # Double EWG (stronger)
+            'C(C(=O)N)=CC#N'    # Amide + EWG (strongest)
         ]
 
         self.solvents = ['hexane', 'DCM', 'acetonitrile']
@@ -71,10 +77,15 @@ class DielsAlderSelectivityEnv(gym.Env):
     def _update_state(self):
         fp = self._featurize_molecule(self.dienophile)
 
-        ewg = float(self.dienophile in [
-            'C(C#N)=CC#N',
-            'C(C(=O)N)=CC#N'
-        ])
+        # EWG strength (0 = weak, 1 = strong)
+        if self.dienophile == 'C(C(=O)N)=CC#N':
+            ewg = 1.0  # Strongest
+        elif self.dienophile == 'C(C#N)=CC#N':
+            ewg = 0.8  # Strong
+        elif self.dienophile == 'C=CC#N':
+            ewg = 0.5  # Moderate
+        else:
+            ewg = 0.3  # Weak
 
         polarity = self.solvent_polarity[self.solvent]
 
@@ -115,32 +126,79 @@ class DielsAlderSelectivityEnv(gym.Env):
 
         self._update_state()
 
-        # Stochastic chemistry
-        endo_prob = 0.8 if self.solvent in ['DCM', 'acetonitrile'] else 0.3
+        # ============================================
+        # IMPROVED CHEMISTRY MODEL
+        # ============================================
+        
+        # 1. Endo selectivity (polar solvents favor endo)
+        if self.solvent == 'acetonitrile':
+            endo_prob = 0.95
+        elif self.solvent == 'DCM':
+            endo_prob = 0.85
+        else:  # hexane
+            endo_prob = 0.25
+        
         endo = int(self.np_random.random() < endo_prob)
 
+        # 2. Regioselectivity (depends on dienophile)
         if self.dienophile == 'C=CC#N':
-            regio_prob = 0.9
+            regio_prob = 0.95  # Simple, very selective
         elif self.dienophile == 'CC=CC#N':
-            regio_prob = 0.8
-        else:
-            regio_prob = 0.5
+            regio_prob = 0.85  # Methyl causes some issues
+        elif self.dienophile == 'C(C#N)=CC#N':
+            regio_prob = 0.70  # Two EWGs = moderate
+        else:  # 'C(C(=O)N)=CC#N'
+            regio_prob = 0.80  # Strong directing effect
 
         regio_correct = int(self.np_random.random() < regio_prob)
 
-        ewg_bonus = float(self.dienophile in [
-            'C(C#N)=CC#N',
-            'C(C(=O)N)=CC#N'
-        ])
+        # 3. Activation barrier (deltaG in kcal/mol)
+        # Strong EWGs lower the barrier
+        if self.dienophile == 'C(C(=O)N)=CC#N':
+            base_deltaG = 14.0
+        elif self.dienophile == 'C(C#N)=CC#N':
+            base_deltaG = 16.0
+        elif self.dienophile == 'C=CC#N':
+            base_deltaG = 18.0
+        else:  # 'CC=CC#N'
+            base_deltaG = 19.0
 
-        deltaG = 20.0 - 5.0 * self.np_random.random() * ewg_bonus
+        # Temperature effect (higher temp helps overcome barrier)
+        temp_factor = (self.temperature - 250) / 150.0  # 0 to 1
+        deltaG = base_deltaG * (1.0 - 0.2 * temp_factor)
+        
+        # Add small randomness
+        deltaG += self.np_random.uniform(-1.0, 1.0)
 
-        reward = (
-            -0.1 * deltaG +
-            1.0 * endo +
-            1.0 * regio_correct +
-            self.np_random.normal(0.0, 0.05)
-        )
+        # ============================================
+        # IMPROVED REWARD STRUCTURE
+        # ============================================
+        
+        reward = 0.0
+        
+        # Major rewards for selectivity (most important)
+        reward += 3.0 * endo             # Endo product is highly desirable
+        reward += 2.0 * regio_correct    # Regioselectivity is important
+        
+        # Barrier penalty (want low barrier for faster reaction)
+        # Normalize so typical barriers give -0.5 to -1.5 penalty
+        reward -= 0.1 * deltaG
+        
+        # Bonus for using strong EWG dienophiles (good chemistry practice)
+        if self.dienophile in ['C(C#N)=CC#N', 'C(C(=O)N)=CC#N']:
+            reward += 0.5
+        
+        # Shaping reward: polar solvent + strong EWG is a smart combo
+        if self.solvent in ['DCM', 'acetonitrile'] and \
+           self.dienophile in ['C(C#N)=CC#N', 'C(C(=O)N)=CC#N']:
+            reward += 0.3
+        
+        # Small penalty for extreme temperatures (simulate practicality)
+        if self.temperature > 380 or self.temperature < 260:
+            reward -= 0.2
+        
+        # Small noise to encourage exploration
+        reward += self.np_random.normal(0.0, 0.05)
 
         self.step_count += 1
         terminated = False
@@ -148,7 +206,12 @@ class DielsAlderSelectivityEnv(gym.Env):
 
         info = {
             "endo": endo,
-            "regio_correct": regio_correct
+            "regio_correct": regio_correct,
+            "deltaG": float(deltaG),
+            "temperature": self.temperature,
+            "solvent": self.solvent,
+            "dienophile": self.dienophile
         }
 
         return self.state.astype(np.float32), float(reward), terminated, truncated, info
+    

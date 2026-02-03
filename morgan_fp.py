@@ -46,3 +46,4 @@ class MorganFingerprintGenerator:
         Returns a (n_bits,) float32 numpy array.
         """
         return self._fp_from_smiles(smiles).copy()
+    
