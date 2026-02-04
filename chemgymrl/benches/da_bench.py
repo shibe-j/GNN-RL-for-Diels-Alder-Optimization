@@ -2,12 +2,38 @@ import numpy as np
 from chemistrylab.util.reward import RewardGenerator
 from chemistrylab import material, vessel
 from chemistrylab.benches.general_bench import *
-from chemistrylab.reactions.reaction_info import ReactInfo, REACTION_PATH
+from chemistrylab.reactions.reaction_info import ReactInfo
 from chemistrylab.reactions.reaction import Reaction
 from chemistrylab.lab.shelf import Shelf
 
 from chemgymrl.reactions import REACTION_PATH
-from chemgymrl.materials.but_and_acr_materials import Butadiene, Acrylonitrile, Cyanocyclohexene
+from chemgymrl.materials import but_and_acr_materials  # noqa: F401  (registers materials)
+
+# --- debug instrumentation (python -> NDJSON file) ---
+import json as _json
+import time as _time
+from pathlib import Path as _Path
+
+_DEBUG_LOG_PATH = _Path(__file__).resolve().parents[2] / ".cursor" / "debug.log"
+
+def _dbg_log(*, runId: str, hypothesisId: str, location: str, message: str, data: dict):
+    # #region agent log
+    try:
+        _DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sessionId": "debug-session",
+            "runId": runId,
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(_time.time() * 1000),
+        }
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(payload) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
 
 def get_mat(mat, amount, name=None):
@@ -54,7 +80,7 @@ class DielsAlderReact_v0(GenBench):
     
         shelf = Shelf([
             get_mat("Butadiene", 1, "Reaction Vessel"),
-            get_mat("Acrylonitrile", 1,"")
+            get_mat("Acrylonitrile", 1, "Acrylonitrile Vessel")
         ])
 
         actions=[
@@ -68,12 +94,23 @@ class DielsAlderReact_v0(GenBench):
         ]
         """
 
-        react_info = ReactInfo.from_json(REACTION_PATH+"/diels_alder.json")
-        print("="*70)
-        print("LOADED REACTION PARAMETERS:")
-        print(f"Activation Energy: {float(react_info.activ_energy_arr):.1f} J/mol")
-        print(f"Pre-exponential Factor: {float(react_info.pre_exp_arr):.2e}")
-        print("="*70)
+        react_info = ReactInfo.from_json(REACTION_PATH + "/diels_alder.json")
+        _dbg_log(
+            runId="pre-fix",
+            hypothesisId="H2",
+            location="chemgymrl/benches/da_bench.py:__init__",
+            message="Loaded ReactInfo",
+            data={
+                "name": getattr(react_info, "name", None),
+                "REACTANTS": getattr(react_info, "REACTANTS", None),
+                "PRODUCTS": getattr(react_info, "PRODUCTS", None),
+                "MATERIALS": getattr(react_info, "MATERIALS", None),
+                "pre_exp_shape": getattr(getattr(react_info, "pre_exp_arr", None), "shape", None),
+                "Ea_shape": getattr(getattr(react_info, "activ_energy_arr", None), "shape", None),
+                "stoich_shape": getattr(getattr(react_info, "stoich_coeff_arr", None), "shape", None),
+                "conc_shape": getattr(getattr(react_info, "conc_coeff_arr", None), "shape", None),
+            },
+        )
         
         super(DielsAlderReact_v0, self).__init__(
             shelf,
@@ -86,13 +123,106 @@ class DielsAlderReact_v0(GenBench):
             #discrete=True,
             max_steps=20
         )
+        _dbg_log(
+            runId="pre-fix",
+            hypothesisId="H1",
+            location="chemgymrl/benches/da_bench.py:__init__",
+            message="Bench initialized",
+            data={
+                "actions_n": len(actions),
+                "targets": react_info.PRODUCTS,
+                "max_steps": 20,
+                "default_events": ["react"],
+            },
+        )
 
-        def get_keys_to_action(self):
-            # Control with the numpad or number keys.
-            keys = dict()
-            for i in range(5):
-                arr = np.zeros(5)
-                arr[i] = 1
-                keys[str(i + 1)] = arr
-            keys[()] = np.zeros(5)
-            return keys
+    def reset(self, **kwargs):
+        out = super().reset(**kwargs)
+        # Try to snapshot starting moles in reaction vessel
+        rv = None
+        try:
+            rv = self.shelf[0]
+        except Exception:
+            pass
+        mats = {}
+        if rv is not None:
+            try:
+                for k, m in rv.material_dict.items():
+                    mats[k] = float(getattr(m, "mol", 0.0))
+            except Exception:
+                mats = {"_err": "could_not_read_materials"}
+        _dbg_log(
+            runId="pre-fix",
+            hypothesisId="H3",
+            location="chemgymrl/benches/da_bench.py:reset",
+            message="Reset snapshot",
+            data={"reaction_vessel_mol": mats},
+        )
+        # Track product moles to provide dense reward signal.
+        # This avoids the common issue where the built-in reward only appears at episode end.
+        try:
+            self._prev_product_mol = float(mats.get("Cyanocyclohexene", 0.0))  # type: ignore[attr-defined]
+        except Exception:
+            self._prev_product_mol = 0.0  # type: ignore[attr-defined]
+        return out
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = super().step(action)
+        # Snapshot key quantities after step
+        rv = None
+        try:
+            rv = self.shelf[0]
+        except Exception:
+            pass
+        mats = {}
+        if rv is not None:
+            try:
+                for k, m in rv.material_dict.items():
+                    mats[k] = float(getattr(m, "mol", 0.0))
+            except Exception:
+                mats = {"_err": "could_not_read_materials"}
+
+        # Dense reward: positive delta in product moles each step.
+        # Keep the original reward in info for debugging/compare.
+        dense_reward = reward
+        try:
+            current_prod = float(mats.get("Cyanocyclohexene", 0.0))
+            prev_prod = float(getattr(self, "_prev_product_mol", 0.0))
+            delta = current_prod - prev_prod
+            if delta < 0:
+                delta = 0.0
+            dense_reward = float(delta)
+            self._prev_product_mol = current_prod  # type: ignore[attr-defined]
+            if isinstance(info, dict):
+                info = dict(info)
+                info["orig_reward"] = float(reward) if np.isscalar(reward) else str(reward)
+                info["product_mol"] = current_prod
+                info["product_delta"] = dense_reward
+        except Exception:
+            pass
+        _dbg_log(
+            runId="post-fix",
+            hypothesisId="H1",
+            location="chemgymrl/benches/da_bench.py:step",
+            message="Step snapshot",
+            data={
+                "action": np.asarray(action).tolist() if hasattr(action, "__len__") else action,
+                "reward": float(dense_reward) if np.isscalar(dense_reward) else str(dense_reward),
+                "orig_reward": float(reward) if np.isscalar(reward) else str(reward),
+                "terminated": bool(terminated),
+                "truncated": bool(truncated),
+                "reaction_vessel_mol": mats,
+                "info_keys": list(info.keys()) if isinstance(info, dict) else str(type(info)),
+            },
+        )
+        return obs, dense_reward, terminated, truncated, info
+
+    def get_keys_to_action(self):
+        # Control with the numpad or number keys.
+        keys = dict()
+        for i in range(5):
+            arr = np.zeros(5)
+            arr[i] = 1
+            keys[str(i + 1)] = arr
+        keys[()] = np.zeros(5)
+        return keys

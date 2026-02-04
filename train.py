@@ -14,7 +14,13 @@ TOTAL_TIMESTEPS = 1_000_000
 
 def make_env(seed_offset=0):
     def _init():
-        env = DielsAlderSelectivityEnv(seed=SEED + seed_offset, max_steps=20)
+        env = DielsAlderSelectivityEnv(
+            seed=SEED + seed_offset,
+            max_steps=20,
+            temp_step=5,
+            temp_c_min=0,
+            temp_c_max=200,
+        )
         return Monitor(env)
     return _init
 
@@ -103,15 +109,14 @@ model = PPO.load("ppo_da_agent_improved", env=test_env)
 obs = test_env.reset()
 
 action_names = {
-    0: "Dienophile: C=CC#N",
-    1: "Dienophile: CC=CC#N", 
-    2: "Dienophile: C(C#N)=CC#N",
-    3: "Dienophile: C(C(=O)N)=CC#N",
-    4: "Solvent: hexane",
-    5: "Solvent: DCM",
-    6: "Solvent: acetonitrile",
-    7: "Temp +10",
-    8: "Temp -10"
+    0: "Solvent: hexane",
+    1: "Solvent: DCM",
+    2: "Solvent: acetonitrile",
+    3: "Catalyst: none",
+    4: "Catalyst: lewis_acid",
+    5: "Catalyst: organocatalyst",
+    6: "Temp +5",
+    7: "Temp -5",
 }
 
 print("\nStarting test episode...\n")
@@ -135,8 +140,12 @@ for step in range(20):
           f"R: {reward[0]:6.3f} | "
           f"Endo: {info['endo']} | "
           f"Regio: {info['regio_correct']} | "
-          f"ΔG: {info['deltaG']:5.2f} | "
-          f"T: {info['temperature']:3d}°C")
+          f"ΔG‡: {info['dg_dagger_kcal_mol']:5.2f} | "
+          f"T: {info['temperature_c']:3d}°C | "
+          f"Y: {info['yield_proxy']:.3f} | "
+          f"X: {info['conversion']:.3f} | "
+          f"Side: {info['side_fraction']:.3f} | "
+          f"Cat: {info['catalyst']}")
 
     if done:
         break
@@ -147,9 +156,14 @@ print("=" * 60)
 print(f"Total reward:        {total_reward:.3f}")
 print(f"Endo selectivity:    {endo_count}/20 ({100*endo_count/20:.0f}%)")
 print(f"Regioselectivity:    {regio_count}/20 ({100*regio_count/20:.0f}%)")
-print(f"Final temperature:   {info['temperature']}°C")
+print(f"Final temperature:   {info['temperature_c']}°C")
 print(f"Final solvent:       {info['solvent']}")
-print(f"Final dienophile:    {info['dienophile']}")
+print(f"Final catalyst:      {info['catalyst']}")
+print(f"Diene SMILES:        {info['diene_smiles']}")
+print(f"Dienophile SMILES:   {info['dienophile_smiles']}")
+print(f"Final conversion:    {info['conversion']:.3f}")
+print(f"Final side fraction: {info['side_fraction']:.3f}")
+print(f"Final yield proxy:   {info['yield_proxy']:.3f}")
 print("=" * 60)
 
 print("\n✅ Training complete! The agent should now show:")
