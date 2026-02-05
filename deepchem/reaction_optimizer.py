@@ -1,0 +1,654 @@
+import argparse
+import json
+import os
+from pathlib import Path
+
+import gymnasium as gym
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from gymnasium import spaces
+from rdkit import Chem
+from torch_geometric.data import Data
+from torch_geometric.nn import LayerNorm, TransformerConv, global_max_pool, global_mean_pool
+from torch.nn import Dropout, Linear, ReLU, Sequential
+
+TARGET_COL = "Min_TSـall"
+DEFAULT_ROW_IDX = 0
+DEFAULT_DATA_FILE = "data/evaluation_data.csv"
+
+try:
+    from stable_baselines3 import PPO
+except ImportError:  # pragma: no cover - optional dependency
+    PPO = None
+
+
+def id_to_smiles(id_str, is_diene: bool = True) -> str:
+    lookup = {
+        "1": "F",
+        "2": "C#N",
+        "3": "OC",
+        "4": "C",
+        "5": "C(C)(C)C",
+        "6": "",
+        "7": "c1ccccc1",
+        "8": "C(=O)OC",
+        "9": "C=O",
+    }
+
+    parts = str(id_str).split("_")
+    groups = [lookup.get(p, "") for p in parts]
+
+    if is_diene:
+        g1, g2, g3, g4 = groups
+        c1 = f"({g1})" if g1 else ""
+        c2 = f"({g2})" if g2 else ""
+        c3 = f"({g3})" if g3 else ""
+        c4 = f"({g4})" if g4 else ""
+        smiles = f"C{c1}=C{c2}C{c3}=C{c4}"
+    else:
+        g1, g2 = groups
+        c1 = f"({g1})" if g1 else ""
+        c2 = f"({g2})" if g2 else ""
+        smiles = f"C{c1}=C{c2}"
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol:
+        return Chem.MolToSmiles(mol)
+    return smiles
+
+
+def _normalize_list(values, means, stds):
+    values = np.array(values, dtype=float)
+    stds = np.where(stds == 0, 1.0, stds)
+    return ((values - means) / stds).tolist()
+
+
+def mol_to_pyg_data(smiles, pz_pops, nbo_charges, volumes) -> Data:
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+
+    num_atoms = mol.GetNumAtoms()
+
+    frags = Chem.GetMolFrags(mol)
+    frag_id = np.zeros(num_atoms, dtype=int)
+    for frag_idx, atom_idxs in enumerate(frags):
+        for atom_idx in atom_idxs:
+            frag_id[atom_idx] = frag_idx
+
+    pz = np.zeros(num_atoms, dtype=float)
+    nbo = np.zeros(num_atoms, dtype=float)
+    vol = np.zeros(num_atoms, dtype=float)
+
+    if len(frags) > 0:
+        diene_atoms = list(frags[0])
+        for i, atom_idx in enumerate(diene_atoms[:4]):
+            if i < len(pz_pops):
+                pz[atom_idx] = pz_pops[i]
+            if i < len(nbo_charges):
+                nbo[atom_idx] = nbo_charges[i]
+            if i < len(volumes):
+                vol[atom_idx] = volumes[i]
+
+    if len(frags) > 1:
+        dienophile_atoms = list(frags[1])
+        for j, atom_idx in enumerate(dienophile_atoms[:2]):
+            src = 4 + j
+            if src < len(pz_pops):
+                pz[atom_idx] = pz_pops[src]
+            if src < len(nbo_charges):
+                nbo[atom_idx] = nbo_charges[src]
+            if src < len(volumes):
+                vol[atom_idx] = volumes[src]
+
+    node_features = []
+    for atom in mol.GetAtoms():
+        atom_idx = atom.GetIdx()
+        atomic_num = atom.GetAtomicNum() / 20.0
+        node_features.append(
+            [
+                atomic_num,
+                float(pz[atom_idx]),
+                float(nbo[atom_idx]),
+                float(vol[atom_idx]),
+                0.0 if frag_id[atom_idx] == 0 else 1.0,
+            ]
+        )
+
+    x = torch.tensor(node_features, dtype=torch.float)
+
+    edge_indices = []
+    edge_attrs = []
+    bond_type_map = {
+        Chem.rdchem.BondType.SINGLE: [1, 0, 0],
+        Chem.rdchem.BondType.DOUBLE: [0, 1, 0],
+        Chem.rdchem.BondType.AROMATIC: [0, 0, 1],
+    }
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        b_type = bond_type_map.get(bond.GetBondType(), [0, 0, 0])
+        edge_indices += [[i, j], [j, i]]
+        edge_attrs += [b_type, b_type]
+
+    edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
+    edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
+
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+
+
+def create_reaction_graph_from_row(row, feature_stats) -> Data:
+    diene_smi = id_to_smiles(row["diene"], is_diene=True)
+    dienophile_smi = id_to_smiles(row["dienophile"], is_diene=False)
+    combined_smi = f"{diene_smi}.{dienophile_smi}"
+
+    pz_list = [
+        row["pz_pop_C1_D"],
+        row["pz_pop_C2_D"],
+        row["pz_pop_C3_D"],
+        row["pz_pop_C4_D"],
+        row["pz_pop_C1_dPh"],
+        row["pz_pop_C2_dPh"],
+    ]
+    nbo_list = [
+        row["NBO_1_D"],
+        row["NBO_2_D"],
+        row["NBO_3_D"],
+        row["NBO_4_D"],
+        row["NBO_1dPh"],
+        row["NBO_2_dPh"],
+    ]
+    vol_list = [
+        row["Volume_D_1"],
+        row["Volume_D_2"],
+        row["Volume_D_3"],
+        row["Volume_D_4"],
+        row["Volume_dPh_1"],
+        row["Volume_dPh_2"],
+    ]
+
+    pz_list = _normalize_list(pz_list, feature_stats["pz_means"], feature_stats["pz_stds"])
+    nbo_list = _normalize_list(nbo_list, feature_stats["nbo_means"], feature_stats["nbo_stds"])
+    vol_list = _normalize_list(vol_list, feature_stats["vol_means"], feature_stats["vol_stds"])
+
+    graph = mol_to_pyg_data(combined_smi, pz_list, nbo_list, vol_list)
+    return graph
+
+
+def build_feature_stats(train_df) -> dict:
+    pz_cols = [
+        "pz_pop_C1_D",
+        "pz_pop_C2_D",
+        "pz_pop_C3_D",
+        "pz_pop_C4_D",
+        "pz_pop_C1_dPh",
+        "pz_pop_C2_dPh",
+    ]
+    nbo_cols = [
+        "NBO_1_D",
+        "NBO_2_D",
+        "NBO_3_D",
+        "NBO_4_D",
+        "NBO_1dPh",
+        "NBO_2_dPh",
+    ]
+    vol_cols = [
+        "Volume_D_1",
+        "Volume_D_2",
+        "Volume_D_3",
+        "Volume_D_4",
+        "Volume_dPh_1",
+        "Volume_dPh_2",
+    ]
+
+    return {
+        "pz_means": train_df[pz_cols].mean().values,
+        "pz_stds": train_df[pz_cols].std().replace(0, 1.0).values,
+        "nbo_means": train_df[nbo_cols].mean().values,
+        "nbo_stds": train_df[nbo_cols].std().replace(0, 1.0).values,
+        "vol_means": train_df[vol_cols].mean().values,
+        "vol_stds": train_df[vol_cols].std().replace(0, 1.0).values,
+    }
+
+
+class DielsAlderTransformer(torch.nn.Module):
+    def __init__(self, input_dim, edge_dim, hidden_dim=96, heads=4, dropout=0.1):
+        super().__init__()
+
+        self.conv1 = TransformerConv(
+            input_dim, hidden_dim, heads=heads, edge_dim=edge_dim, dropout=dropout
+        )
+        self.ln1 = LayerNorm(hidden_dim * heads)
+
+        self.conv2 = TransformerConv(
+            hidden_dim * heads, hidden_dim, heads=heads, edge_dim=edge_dim, dropout=dropout
+        )
+        self.ln2 = LayerNorm(hidden_dim * heads)
+
+        self.conv3 = TransformerConv(
+            hidden_dim * heads, hidden_dim, heads=heads, edge_dim=edge_dim, dropout=dropout
+        )
+        self.ln3 = LayerNorm(hidden_dim * heads)
+
+        self.dropout = Dropout(dropout)
+        self.mlp = Sequential(
+            Linear(hidden_dim * heads * 2, hidden_dim),
+            ReLU(),
+            Dropout(dropout),
+            Linear(hidden_dim, 1),
+        )
+
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = (
+            data.x,
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
+
+        x1 = self.conv1(x, edge_index, edge_attr)
+        x1 = self.dropout(torch.relu(self.ln1(x1)))
+
+        x2 = self.conv2(x1, edge_index, edge_attr)
+        x2 = self.dropout(torch.relu(self.ln2(x2 + x1)))
+
+        x3 = self.conv3(x2, edge_index, edge_attr)
+        x3 = self.dropout(torch.relu(self.ln3(x3 + x2)))
+
+        x_mean = global_mean_pool(x3, batch)
+        x_max = global_max_pool(x3, batch)
+        x = torch.cat([x_mean, x_max], dim=-1)
+
+        return self.mlp(x)
+
+
+class ConditionAwareTransformer(torch.nn.Module):
+    """Wraps DielsAlderTransformer and injects reaction conditions."""
+
+    def __init__(self, base_model: DielsAlderTransformer, condition_dim: int = 2):
+        super().__init__()
+        self.base = base_model
+
+        base_in = self.base.mlp[0].in_features
+        base_hidden = self.base.mlp[0].out_features
+        dropout = self.base.mlp[2].p if hasattr(self.base.mlp[2], "p") else 0.1
+
+        self.conditioned_mlp = torch.nn.Sequential(
+            torch.nn.Linear(base_in + condition_dim, base_hidden),
+            torch.nn.ReLU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(base_hidden, 1),
+        )
+
+    def _pooled_graph_features(self, data):
+        if not hasattr(data, "batch") or data.batch is None:
+            data.batch = torch.zeros(
+                data.num_nodes, dtype=torch.long, device=data.x.device
+            )
+        x, edge_index, edge_attr, batch = (
+            data.x,
+            data.edge_index,
+            data.edge_attr,
+            data.batch,
+        )
+
+        x1 = self.base.conv1(x, edge_index, edge_attr)
+        x1 = self.base.dropout(torch.relu(self.base.ln1(x1)))
+
+        x2 = self.base.conv2(x1, edge_index, edge_attr)
+        x2 = self.base.dropout(torch.relu(self.base.ln2(x2 + x1)))
+
+        x3 = self.base.conv3(x2, edge_index, edge_attr)
+        x3 = self.base.dropout(torch.relu(self.base.ln3(x3 + x2)))
+
+        x_mean = global_mean_pool(x3, batch)
+        x_max = global_max_pool(x3, batch)
+        return torch.cat([x_mean, x_max], dim=-1)
+
+    def forward(self, data, conditions):
+        pooled = self._pooled_graph_features(data)
+        if conditions.dim() == 1:
+            conditions = conditions.unsqueeze(0)
+        x = torch.cat([pooled, conditions], dim=-1)
+        return self.conditioned_mlp(x)
+
+
+class DielsAlderOptEnv(gym.Env):
+    metadata = {"render_modes": []}
+
+    def __init__(
+        self,
+        graph_data,
+        model,
+        ts_mean,
+        ts_std,
+        device,
+        max_steps=1,
+    ):
+        super().__init__()
+        self.graph_data = graph_data.to(device)
+        self.model = model
+        self.ts_mean = ts_mean
+        self.ts_std = ts_std
+        self.device = device
+        self.max_steps = max_steps
+        self.steps = 0
+        self.temp_min_k = 273.0
+        self.temp_max_k = 473.0
+        self.conc_min_m = 0.01
+        self.conc_max_m = 5.0
+        self.side_reaction_temp_k = 400.0
+        self.side_reaction_penalty_per_k = 0.01
+        self.ref_temp_k = 298.15
+        self.ref_conc_m = 1.0
+        self.reward_log_span = 5.0
+
+        self.kb_j_per_k = 1.380649e-23
+        self.h_j_s = 6.62607015e-34
+        self.r_kcal_per_mol_k = 1.987204258e-3
+        self.rate_floor = 1e-40
+
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
+
+        with torch.no_grad():
+            self.model.eval()
+            graph_features = self.model._pooled_graph_features(self.graph_data)
+        self.observation = graph_features.detach().cpu().numpy().astype(np.float32).squeeze()
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=self.observation.shape, dtype=np.float32
+        )
+
+    def reset(self, *, seed=None, options=None):
+        super().reset(seed=seed)
+        self.steps = 0
+        return self.observation, {}
+
+    def _calculate_reaction_rate(self, predicted_delta_g, temp_norm, conc_norm):
+        temp_k = self.temp_min_k + temp_norm * (self.temp_max_k - self.temp_min_k)
+        conc_m = self.conc_min_m + conc_norm * (self.conc_max_m - self.conc_min_m)
+
+        k = (self.kb_j_per_k * temp_k / self.h_j_s) * np.exp(
+            -predicted_delta_g / (self.r_kcal_per_mol_k * temp_k)
+        )
+        rate = k * (conc_m**2)
+        return rate, k, temp_k, conc_m
+
+    def _calculate_reference_rate(self, predicted_delta_g):
+        k_ref = (self.kb_j_per_k * self.ref_temp_k / self.h_j_s) * np.exp(
+            -predicted_delta_g / (self.r_kcal_per_mol_k * self.ref_temp_k)
+        )
+        rate_ref = k_ref * (self.ref_conc_m**2)
+        return rate_ref, k_ref
+
+    def _normalized_log_reward(self, rate, rate_ref):
+        log_rate = np.log10(max(rate, self.rate_floor))
+        log_ref = np.log10(max(rate_ref, self.rate_floor))
+        return (log_rate - log_ref) / self.reward_log_span
+
+    def step(self, action):
+        self.steps += 1
+        action = np.clip(action, 0.0, 1.0).astype(np.float32)
+        temperature, concentration = float(action[0]), float(action[1])
+
+        conditions = torch.tensor([temperature, concentration], device=self.device)
+        with torch.no_grad():
+            pred_scaled = self.model(self.graph_data, conditions).view(-1)[0]
+
+        predicted_delta_g = float((pred_scaled * self.ts_std) + self.ts_mean)
+        rate, k, temp_k, conc_m = self._calculate_reaction_rate(
+            predicted_delta_g, temperature, concentration
+        )
+        rate_ref, k_ref = self._calculate_reference_rate(predicted_delta_g)
+        reward = float(self._normalized_log_reward(rate, rate_ref))
+        if temp_k > self.side_reaction_temp_k:
+            reward -= self.side_reaction_penalty_per_k * (
+                temp_k - self.side_reaction_temp_k
+            )
+
+        terminated = False
+        truncated = self.steps >= self.max_steps
+        info = {
+            "predicted_delta_g": predicted_delta_g,
+            "rate": float(rate),
+            "rate_ref": float(rate_ref),
+            "k": float(k),
+            "k_ref": float(k_ref),
+            "temp_k": float(temp_k),
+            "conc_m": float(conc_m),
+        }
+        return self.observation, float(reward), terminated, truncated, info
+
+
+def load_stats(data_root: Path, stats_path: str | None):
+    if stats_path:
+        with open(stats_path, "r", encoding="utf-8") as f:
+            stats = json.load(f)
+    else:
+        stats = {}
+
+    train_path = data_root / "data" / "train.csv"
+    if "ts_mean" not in stats or "ts_std" not in stats or "feature_stats" not in stats:
+        df_training = pd.read_csv(train_path)
+        if "Min_TSـall" not in df_training.columns:
+            raise ValueError("Min_TSـall column not found in train.csv.")
+
+        stats.setdefault("ts_mean", float(df_training["Min_TSـall"].mean()))
+        stats.setdefault("ts_std", float(df_training["Min_TSـall"].std()))
+        stats.setdefault("feature_stats", build_feature_stats(df_training))
+
+    return stats
+
+
+def build_graph_from_row(row, feature_stats: dict):
+    return create_reaction_graph_from_row(row, feature_stats)
+
+
+def plot_optimization_landscape(env, temp_steps=25, conc_steps=25):
+    temps = np.linspace(0.0, 1.0, temp_steps)
+    concs = np.linspace(0.0, 1.0, conc_steps)
+    temp_grid, conc_grid = np.meshgrid(temps, concs)
+    reward_grid = np.zeros_like(temp_grid, dtype=float)
+
+    env.model.eval()
+    with torch.no_grad():
+        for i in range(temp_steps):
+            for j in range(conc_steps):
+                t = float(temp_grid[j, i])
+                c = float(conc_grid[j, i])
+                conditions = torch.tensor([t, c], device=env.device)
+                pred_scaled = env.model(env.graph_data, conditions).view(-1)[0]
+                predicted_delta_g = float((pred_scaled * env.ts_std) + env.ts_mean)
+                rate, _, temp_k, _ = env._calculate_reaction_rate(
+                    predicted_delta_g, t, c
+                )
+                rate_ref, _ = env._calculate_reference_rate(predicted_delta_g)
+                reward = float(env._normalized_log_reward(rate, rate_ref))
+                if temp_k > env.side_reaction_temp_k:
+                    reward -= env.side_reaction_penalty_per_k * (
+                        temp_k - env.side_reaction_temp_k
+                    )
+                reward_grid[j, i] = float(reward)
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(temp_grid, conc_grid, reward_grid, cmap="viridis", alpha=0.9)
+    ax.set_xlabel("Temperature (scaled)")
+    ax.set_ylabel("Concentration (scaled)")
+    ax.set_zlabel("Reward")
+    ax.set_title("Optimization Landscape")
+    plt.tight_layout()
+    plt.show()
+
+
+def run_ppo_optimization(env, total_timesteps=5000):
+    if PPO is None:
+        raise ImportError("stable-baselines3 is required for PPO optimization.")
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=total_timesteps)
+    return model
+
+
+def _infer_edge_dim_from_state(state_dict) -> int | None:
+    for key in ("conv1.lin_edge.weight", "conv2.lin_edge.weight", "conv3.lin_edge.weight"):
+        if key in state_dict:
+            return int(state_dict[key].shape[1])
+    return None
+
+
+def _infer_node_dim_from_state(state_dict) -> int | None:
+    for key in (
+        "conv1.lin_key.weight",
+        "conv1.lin_query.weight",
+        "conv1.lin_value.weight",
+        "conv1.lin_skip.weight",
+    ):
+        if key in state_dict:
+            return int(state_dict[key].shape[1])
+    return None
+
+
+def _match_edge_attr_dim(graph_data, edge_dim: int):
+    current_dim = graph_data.edge_attr.size(1)
+    if current_dim == edge_dim:
+        return graph_data
+    if current_dim < edge_dim:
+        pad = edge_dim - current_dim
+        padding = torch.zeros(
+            graph_data.edge_attr.size(0), pad, device=graph_data.edge_attr.device
+        )
+        graph_data.edge_attr = torch.cat([graph_data.edge_attr, padding], dim=1)
+    else:
+        graph_data.edge_attr = graph_data.edge_attr[:, :edge_dim]
+    return graph_data
+
+
+def _match_node_attr_dim(graph_data, node_dim: int):
+    current_dim = graph_data.x.size(1)
+    if current_dim == node_dim:
+        return graph_data
+    if current_dim < node_dim:
+        pad = node_dim - current_dim
+        padding = torch.zeros(
+            graph_data.x.size(0), pad, device=graph_data.x.device
+        )
+        graph_data.x = torch.cat([graph_data.x, padding], dim=1)
+    else:
+        graph_data.x = graph_data.x[:, :node_dim]
+    return graph_data
+
+
+def _resolve_run_paths(data_root: Path, model_path: str | None, stats_path: str | None):
+    if model_path and stats_path:
+        return model_path, stats_path
+
+    outputs_dir = data_root / "outputs"
+    if not outputs_dir.exists():
+        return model_path, stats_path
+
+    runs = [p for p in outputs_dir.iterdir() if p.is_dir() and p.name.startswith("run-")]
+    if not runs:
+        return model_path, stats_path
+
+    latest = max(runs, key=lambda p: p.name)
+    inferred_model = str((latest / "model.pt").resolve())
+    inferred_stats = str((latest / "stats.json").resolve())
+
+    return model_path or inferred_model, stats_path or inferred_stats
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Optimize Diels-Alder conditions.")
+    parser.add_argument("--data-root", default="deepchem", help="Path to deepchem folder.")
+    parser.add_argument("--model-path", default=None, help="Path to model.pt")
+    parser.add_argument("--stats-path", default=None, help="Path to stats.json")
+    parser.add_argument(
+        "--data-file",
+        default=DEFAULT_DATA_FILE,
+        help="CSV to optimize reactions from (relative to data-root).",
+    )
+    parser.add_argument("--row-idx", type=int, default=DEFAULT_ROW_IDX)
+    parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--max-steps", type=int, default=1)
+    parser.add_argument("--ppo-steps", type=int, default=5000)
+    parser.add_argument("--plot", action="store_true")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    data_root = Path(args.data_root)
+
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
+
+    model_path, stats_path = _resolve_run_paths(
+        data_root, args.model_path, args.stats_path
+    )
+
+    stats = load_stats(data_root, stats_path)
+    ts_mean = float(stats["ts_mean"])
+    ts_std = float(stats["ts_std"])
+    feature_stats = stats["feature_stats"]
+
+    data_path = data_root / args.data_file
+    data_df = pd.read_csv(data_path)
+    if args.row_idx < 0 or args.row_idx >= len(data_df):
+        raise IndexError("row-idx is out of range for selected data file.")
+    row = data_df.iloc[args.row_idx]
+
+    graph_data = build_graph_from_row(row, feature_stats)
+    graph_data = graph_data.to(device)
+
+    state_dict = None
+    expected_edge_dim = None
+    expected_node_dim = None
+    if model_path and os.path.exists(model_path):
+        state_dict = torch.load(model_path, map_location=device)
+        expected_edge_dim = _infer_edge_dim_from_state(state_dict)
+        expected_node_dim = _infer_node_dim_from_state(state_dict)
+
+    edge_dim = expected_edge_dim or graph_data.edge_attr.size(1)
+    node_dim = expected_node_dim or graph_data.x.size(1)
+    graph_data = _match_node_attr_dim(graph_data, node_dim)
+    graph_data = _match_edge_attr_dim(graph_data, edge_dim)
+
+    base_model = DielsAlderTransformer(input_dim=node_dim, edge_dim=edge_dim).to(device)
+    if state_dict is not None:
+        base_model.load_state_dict(state_dict)
+
+    model = ConditionAwareTransformer(base_model).to(device)
+
+    env = DielsAlderOptEnv(
+        graph_data=graph_data,
+        model=model,
+        ts_mean=ts_mean,
+        ts_std=ts_std,
+        device=device,
+        max_steps=args.max_steps,
+    )
+
+    ppo_model = run_ppo_optimization(env, total_timesteps=args.ppo_steps)
+    obs, _ = env.reset()
+    action, _ = ppo_model.predict(obs, deterministic=True)
+    _, reward, _, _, info = env.step(action)
+    diene_id = row["diene"]
+    dienophile_id = row["dienophile"]
+    diene_smi = id_to_smiles(diene_id, is_diene=True)
+    dienophile_smi = id_to_smiles(dienophile_id, is_diene=False)
+    print(
+        f"Data file: {data_path} | row idx {args.row_idx} | "
+        f"diene={diene_id} ({diene_smi}), "
+        f"dienophile={dienophile_id} ({dienophile_smi})"
+    )
+    print(f"Best action (T, C): {action}, reward: {reward:.4f}, info: {info}")
+
+    if args.plot:
+        plot_optimization_landscape(env)
+
+
+if __name__ == "__main__":
+    main()
