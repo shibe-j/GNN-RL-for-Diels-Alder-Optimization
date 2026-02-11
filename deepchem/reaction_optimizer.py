@@ -368,9 +368,9 @@ class DielsAlderTransformer(torch.nn.Module):
 
 
 class ConditionAwareTransformer(torch.nn.Module):
-    """Wraps DielsAlderTransformer and injects reaction conditions."""
+    """Wraps DielsAlderTransformer and injects reaction conditions (T, conc_diene, conc_dienophile)."""
 
-    def __init__(self, base_model: DielsAlderTransformer, condition_dim: int = 2):
+    def __init__(self, base_model: DielsAlderTransformer, condition_dim: int = 3):
         super().__init__()
         self.base = base_model
 
@@ -453,7 +453,7 @@ class DielsAlderOptEnv(gym.Env):
         self.r_kcal_per_mol_k = 1.987204258e-3
         self.rate_floor = 1e-40
 
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32)
 
         with torch.no_grad():
             self.model.eval()
@@ -468,15 +468,16 @@ class DielsAlderOptEnv(gym.Env):
         self.steps = 0
         return self.observation, {}
 
-    def _calculate_reaction_rate(self, predicted_delta_g, temp_norm, conc_norm):
+    def _calculate_reaction_rate(self, predicted_delta_g, temp_norm, conc_diene_norm, conc_dienophile_norm):
         temp_k = self.temp_min_k + temp_norm * (self.temp_max_k - self.temp_min_k)
-        conc_m = self.conc_min_m + conc_norm * (self.conc_max_m - self.conc_min_m)
+        conc_diene_m = self.conc_min_m + conc_diene_norm * (self.conc_max_m - self.conc_min_m)
+        conc_dienophile_m = self.conc_min_m + conc_dienophile_norm * (self.conc_max_m - self.conc_min_m)
 
         k = (self.kb_j_per_k * temp_k / self.h_j_s) * np.exp(
             -predicted_delta_g / (self.r_kcal_per_mol_k * temp_k)
         )
-        rate = k * (conc_m**2)
-        return rate, k, temp_k, conc_m
+        rate = k * conc_diene_m * conc_dienophile_m
+        return rate, k, temp_k, conc_diene_m, conc_dienophile_m
 
     def _calculate_reference_rate(self, predicted_delta_g):
         k_ref = (self.kb_j_per_k * self.ref_temp_k / self.h_j_s) * np.exp(
@@ -493,15 +494,19 @@ class DielsAlderOptEnv(gym.Env):
     def step(self, action):
         self.steps += 1
         action = np.clip(action, 0.0, 1.0).astype(np.float32)
-        temperature, concentration = float(action[0]), float(action[1])
+        temperature = float(action[0])
+        conc_diene_norm = float(action[1])
+        conc_dienophile_norm = float(action[2])
 
-        conditions = torch.tensor([temperature, concentration], device=self.device)
+        conditions = torch.tensor(
+            [temperature, conc_diene_norm, conc_dienophile_norm], device=self.device
+        )
         with torch.no_grad():
             pred_scaled = self.model(self.graph_data, conditions).view(-1)[0]
 
         predicted_delta_g = float((pred_scaled * self.ts_std) + self.ts_mean)
-        rate, k, temp_k, conc_m = self._calculate_reaction_rate(
-            predicted_delta_g, temperature, concentration
+        rate, k, temp_k, conc_diene_m, conc_dienophile_m = self._calculate_reaction_rate(
+            predicted_delta_g, temperature, conc_diene_norm, conc_dienophile_norm
         )
         rate_ref, k_ref = self._calculate_reference_rate(predicted_delta_g)
         reward = float(self._normalized_log_reward(rate, rate_ref))
@@ -519,7 +524,8 @@ class DielsAlderOptEnv(gym.Env):
             "k": float(k),
             "k_ref": float(k_ref),
             "temp_k": float(temp_k),
-            "conc_m": float(conc_m),
+            "conc_diene_m": float(conc_diene_m),
+            "conc_dienophile_m": float(conc_dienophile_m),
         }
         return self.observation, float(reward), terminated, truncated, info
 
@@ -551,39 +557,41 @@ def build_graph_from_row(row, feature_stats: dict, node_dim: int | None = None, 
     return create_reaction_graph_from_row(row, feature_stats)
 
 
-def plot_optimization_landscape(env, temp_steps=25, conc_steps=25):
-    temps = np.linspace(0.0, 1.0, temp_steps)
-    concs = np.linspace(0.0, 1.0, conc_steps)
-    temp_grid, conc_grid = np.meshgrid(temps, concs)
-    reward_grid = np.zeros_like(temp_grid, dtype=float)
+def plot_optimization_landscape(env, steps=12):
+    """Plot reward over full 3D condition space (temp, conc_diene, conc_dienophile); color = reward."""
+    temps = np.linspace(0.0, 1.0, steps)
+    conc_diene = np.linspace(0.0, 1.0, steps)
+    conc_dienophile = np.linspace(0.0, 1.0, steps)
+    tt, cd, cph = np.meshgrid(temps, conc_diene, conc_dienophile, indexing="ij")
+    tt = tt.ravel()
+    cd = cd.ravel()
+    cph = cph.ravel()
+    rewards = np.zeros(len(tt), dtype=float)
 
     env.model.eval()
     with torch.no_grad():
-        for i in range(temp_steps):
-            for j in range(conc_steps):
-                t = float(temp_grid[j, i])
-                c = float(conc_grid[j, i])
-                conditions = torch.tensor([t, c], device=env.device)
-                pred_scaled = env.model(env.graph_data, conditions).view(-1)[0]
-                predicted_delta_g = float((pred_scaled * env.ts_std) + env.ts_mean)
-                rate, _, temp_k, _ = env._calculate_reaction_rate(
-                    predicted_delta_g, t, c
-                )
-                rate_ref, _ = env._calculate_reference_rate(predicted_delta_g)
-                reward = float(env._normalized_log_reward(rate, rate_ref))
-                if temp_k > env.side_reaction_temp_k:
-                    reward -= env.side_reaction_penalty_per_k * (
-                        temp_k - env.side_reaction_temp_k
-                    )
-                reward_grid[j, i] = float(reward)
+        for i in range(len(tt)):
+            t, c_d, c_p = float(tt[i]), float(cd[i]), float(cph[i])
+            conditions = torch.tensor([t, c_d, c_p], device=env.device)
+            pred_scaled = env.model(env.graph_data, conditions).view(-1)[0]
+            predicted_delta_g = float((pred_scaled * env.ts_std) + env.ts_mean)
+            rate, _, temp_k, _, _ = env._calculate_reaction_rate(
+                predicted_delta_g, t, c_d, c_p
+            )
+            rate_ref, _ = env._calculate_reference_rate(predicted_delta_g)
+            r = float(env._normalized_log_reward(rate, rate_ref))
+            if temp_k > env.side_reaction_temp_k:
+                r -= env.side_reaction_penalty_per_k * (temp_k - env.side_reaction_temp_k)
+            rewards[i] = r
 
-    fig = plt.figure(figsize=(8, 6))
+    fig = plt.figure(figsize=(10, 8))
     ax = fig.add_subplot(111, projection="3d")
-    ax.plot_surface(temp_grid, conc_grid, reward_grid, cmap="viridis", alpha=0.9)
+    sc = ax.scatter(tt, cd, cph, c=rewards, cmap="viridis", alpha=0.7, s=15)
+    plt.colorbar(sc, ax=ax, label="Reward")
     ax.set_xlabel("Temperature (scaled)")
-    ax.set_ylabel("Concentration (scaled)")
-    ax.set_zlabel("Reward")
-    ax.set_title("Optimization Landscape")
+    ax.set_ylabel("Conc diene (scaled)")
+    ax.set_zlabel("Conc dienophile (scaled)")
+    ax.set_title("Optimization Landscape (3D: color = reward)")
     plt.tight_layout()
     plt.show()
 
@@ -750,7 +758,10 @@ def main():
         f"diene={diene_id} ({diene_smi}), "
         f"dienophile={dienophile_id} ({dienophile_smi})"
     )
-    print(f"Best action (T, C): {action}, reward: {reward:.4f}, info: {info}")
+    print(
+        f"Best action (T_norm, C_diene_norm, C_dienophile_norm): {action}, "
+        f"reward: {reward:.4f}, info: {info}"
+    )
 
     if args.plot:
         plot_optimization_landscape(env)
