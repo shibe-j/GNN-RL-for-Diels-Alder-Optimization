@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover - optional dependency
     PPO = None
 
 
-def id_to_smiles(id_str, is_diene: bool = True) -> str:
+def id_to_smiles(id_str, is_diene: bool = True, mapped: bool = False) -> str:
     lookup = {
         "1": "F",
         "2": "C#N",
@@ -46,12 +46,12 @@ def id_to_smiles(id_str, is_diene: bool = True) -> str:
         c2 = f"({g2})" if g2 else ""
         c3 = f"({g3})" if g3 else ""
         c4 = f"({g4})" if g4 else ""
-        smiles = f"C{c1}=C{c2}C{c3}=C{c4}"
+        smiles = f"[C:1]{c1}=[C:2]{c2}[C:3]{c3}=[C:4]{c4}" if mapped else f"C{c1}=C{c2}C{c3}=C{c4}"
     else:
         g1, g2 = groups
         c1 = f"({g1})" if g1 else ""
         c2 = f"({g2})" if g2 else ""
-        smiles = f"C{c1}=C{c2}"
+        smiles = f"[C:5]{c1}=[C:6]{c2}" if mapped else f"C{c1}=C{c2}"
 
     mol = Chem.MolFromSmiles(smiles)
     if mol:
@@ -61,8 +61,21 @@ def id_to_smiles(id_str, is_diene: bool = True) -> str:
 
 def _normalize_list(values, means, stds):
     values = np.array(values, dtype=float)
+    means = np.asarray(means)
+    stds = np.asarray(stds)
     stds = np.where(stds == 0, 1.0, stds)
     return ((values - means) / stds).tolist()
+
+
+def _hybridization_onehot(atom):
+    hyb = atom.GetHybridization()
+    if hyb == Chem.rdchem.HybridizationType.SP:
+        return [1, 0, 0, 0]
+    if hyb == Chem.rdchem.HybridizationType.SP2:
+        return [0, 1, 0, 0]
+    if hyb == Chem.rdchem.HybridizationType.SP3:
+        return [0, 0, 1, 0]
+    return [0, 0, 0, 1]
 
 
 def mol_to_pyg_data(smiles, pz_pops, nbo_charges, volumes) -> Data:
@@ -175,6 +188,96 @@ def create_reaction_graph_from_row(row, feature_stats) -> Data:
 
     graph = mol_to_pyg_data(combined_smi, pz_list, nbo_list, vol_list)
     return graph
+
+
+def mol_to_pyg_data_impl2(smiles, pz_map, nbo_map, vol_map) -> Data:
+    """Build PyG Data with 15 node dims, 5 edge dims (impl2 format)."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+
+    frags = Chem.GetMolFrags(mol, asMols=False)
+    atom_to_frag = {}
+    for frag_id, atom_ids in enumerate(frags):
+        for atom_id in atom_ids:
+            atom_to_frag[atom_id] = frag_id
+
+    node_features = []
+    for atom in mol.GetAtoms():
+        atom_idx = atom.GetIdx()
+        atom_map = atom.GetAtomMapNum()
+        frag_id = atom_to_frag.get(atom_idx, 0)
+
+        atomic_num = atom.GetAtomicNum() / 20.0
+        degree = atom.GetDegree() / 4.0
+        formal_charge = float(atom.GetFormalCharge())
+        aromatic = 1.0 if atom.GetIsAromatic() else 0.0
+        ring = 1.0 if atom.IsInRing() else 0.0
+        num_hs = atom.GetTotalNumHs() / 4.0
+        mass = atom.GetMass() / 200.0
+        hyb = _hybridization_onehot(atom)
+        pz = float(pz_map.get(atom_map, 0.0))
+        nbo = float(nbo_map.get(atom_map, 0.0))
+        vol = float(vol_map.get(atom_map, 0.0))
+        frag_flag = 0.0 if frag_id == 0 else 1.0
+
+        node_features.append([
+            atomic_num, degree, formal_charge, aromatic, ring, num_hs, mass,
+            *hyb, pz, nbo, vol, frag_flag,
+        ])
+
+    x = torch.tensor(node_features, dtype=torch.float)
+
+    edge_indices = []
+    edge_attrs = []
+    bond_type_map = {
+        Chem.rdchem.BondType.SINGLE: [1, 0, 0],
+        Chem.rdchem.BondType.DOUBLE: [0, 1, 0],
+        Chem.rdchem.BondType.AROMATIC: [0, 0, 1],
+    }
+    for bond in mol.GetBonds():
+        i = bond.GetBeginAtomIdx()
+        j = bond.GetEndAtomIdx()
+        b_type = bond_type_map.get(bond.GetBondType(), [0, 0, 0])
+        conj = 1.0 if bond.GetIsConjugated() else 0.0
+        ring = 1.0 if bond.IsInRing() else 0.0
+        b_feat = b_type + [conj, ring]
+        edge_indices += [[i, j], [j, i]]
+        edge_attrs += [b_feat, b_feat]
+
+    edge_index = torch.tensor(edge_indices, dtype=torch.long).t().contiguous()
+    edge_attr = torch.tensor(edge_attrs, dtype=torch.float)
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+
+
+def create_reaction_graph_from_row_impl2(row, feature_stats) -> Data:
+    """Build reaction graph in impl2 format (15 node, 5 edge) for condition optimizer."""
+    diene_smi = id_to_smiles(row["diene"], is_diene=True, mapped=True)
+    dienophile_smi = id_to_smiles(row["dienophile"], is_diene=False, mapped=True)
+    combined_smi = f"{diene_smi}.{dienophile_smi}"
+
+    pz_list = [
+        row["pz_pop_C1_D"], row["pz_pop_C2_D"], row["pz_pop_C3_D"], row["pz_pop_C4_D"],
+        row["pz_pop_C1_dPh"], row["pz_pop_C2_dPh"],
+    ]
+    nbo_list = [
+        row["NBO_1_D"], row["NBO_2_D"], row["NBO_3_D"], row["NBO_4_D"],
+        row["NBO_1dPh"], row["NBO_2_dPh"],
+    ]
+    vol_list = [
+        row["Volume_D_1"], row["Volume_D_2"], row["Volume_D_3"], row["Volume_D_4"],
+        row["Volume_dPh_1"], row["Volume_dPh_2"],
+    ]
+
+    pz_list = _normalize_list(pz_list, feature_stats["pz_means"], feature_stats["pz_stds"])
+    nbo_list = _normalize_list(nbo_list, feature_stats["nbo_means"], feature_stats["nbo_stds"])
+    vol_list = _normalize_list(vol_list, feature_stats["vol_means"], feature_stats["vol_stds"])
+
+    pz_map = {1: pz_list[0], 2: pz_list[1], 3: pz_list[2], 4: pz_list[3], 5: pz_list[4], 6: pz_list[5]}
+    nbo_map = {1: nbo_list[0], 2: nbo_list[1], 3: nbo_list[2], 4: nbo_list[3], 5: nbo_list[4], 6: nbo_list[5]}
+    vol_map = {1: vol_list[0], 2: vol_list[1], 3: vol_list[2], 4: vol_list[3], 5: vol_list[4], 6: vol_list[5]}
+
+    return mol_to_pyg_data_impl2(combined_smi, pz_map, nbo_map, vol_map)
 
 
 def build_feature_stats(train_df) -> dict:
@@ -441,7 +544,10 @@ def load_stats(data_root: Path, stats_path: str | None):
     return stats
 
 
-def build_graph_from_row(row, feature_stats: dict):
+def build_graph_from_row(row, feature_stats: dict, node_dim: int | None = None, edge_dim: int | None = None):
+    """Build reaction graph. Uses impl2 format (15 node, 5 edge) when model expects it."""
+    if node_dim == 15 and edge_dim == 5:
+        return create_reaction_graph_from_row_impl2(row, feature_stats)
     return create_reaction_graph_from_row(row, feature_stats)
 
 
@@ -600,9 +706,6 @@ def main():
         raise IndexError("row-idx is out of range for selected data file.")
     row = data_df.iloc[args.row_idx]
 
-    graph_data = build_graph_from_row(row, feature_stats)
-    graph_data = graph_data.to(device)
-
     state_dict = None
     expected_edge_dim = None
     expected_node_dim = None
@@ -611,8 +714,11 @@ def main():
         expected_edge_dim = _infer_edge_dim_from_state(state_dict)
         expected_node_dim = _infer_node_dim_from_state(state_dict)
 
-    edge_dim = expected_edge_dim or graph_data.edge_attr.size(1)
-    node_dim = expected_node_dim or graph_data.x.size(1)
+    graph_data = build_graph_from_row(row, feature_stats, expected_node_dim, expected_edge_dim)
+    graph_data = graph_data.to(device)
+
+    edge_dim = graph_data.edge_attr.size(1)
+    node_dim = graph_data.x.size(1)
     graph_data = _match_node_attr_dim(graph_data, node_dim)
     graph_data = _match_edge_attr_dim(graph_data, edge_dim)
 
