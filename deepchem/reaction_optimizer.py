@@ -368,9 +368,11 @@ class DielsAlderTransformer(torch.nn.Module):
 
 
 class ConditionAwareTransformer(torch.nn.Module):
-    """Wraps DielsAlderTransformer and injects reaction conditions (T, conc_diene, conc_dienophile)."""
+    """Wraps DielsAlderTransformer and injects reaction conditions.
+    Conditions: T_norm, conc_diene_norm, conc_dienophile_norm, residence_time_norm, lewis_acid_norm.
+    """
 
-    def __init__(self, base_model: DielsAlderTransformer, condition_dim: int = 3):
+    def __init__(self, base_model: DielsAlderTransformer, condition_dim: int = 5):
         super().__init__()
         self.base = base_model
 
@@ -438,10 +440,19 @@ class DielsAlderOptEnv(gym.Env):
         self.device = device
         self.max_steps = max_steps
         self.steps = 0
-        self.temp_min_k = 273.0
-        self.temp_max_k = 473.0
+        # Thermal: [0,1] → 20°C to 39.6°C (DCM boiling point; dataset solvent)
+        self.temp_min_k = 293.15
+        self.temp_max_k = 273.15 + 39.6  # 312.75 K
         self.conc_min_m = 0.01
         self.conc_max_m = 5.0
+        # Kinetic: [0,1] → 1 min to 24 hrs (seconds)
+        self.t_min_s = 60.0
+        self.t_max_s = 24.0 * 3600.0
+        self.t_ref_s = 3600.0
+        # Catalytic: [0,1] → 0 to 0.5 eq Lewis acid
+        self.lewis_min_eq = 0.0
+        self.lewis_max_eq = 0.5
+        self.lewis_delta_g_kcal_per_eq = 4.0  # phenomenological: catalyst lowers barrier
         self.side_reaction_temp_k = 400.0
         self.side_reaction_penalty_per_k = 0.01
         self.ref_temp_k = 298.15
@@ -453,7 +464,8 @@ class DielsAlderOptEnv(gym.Env):
         self.r_kcal_per_mol_k = 1.987204258e-3
         self.rate_floor = 1e-40
 
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32)
+        # Actions: T_norm, conc_diene_norm, conc_dienophile_norm, residence_time_norm, lewis_acid_norm
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(5,), dtype=np.float32)
 
         with torch.no_grad():
             self.model.eval()
@@ -491,25 +503,52 @@ class DielsAlderOptEnv(gym.Env):
         log_ref = np.log10(max(rate_ref, self.rate_floor))
         return (log_rate - log_ref) / self.reward_log_span
 
+    def _normalized_log_reward_time_weighted(self, rate, t_sec, rate_ref, t_ref_s):
+        """Reward based on rate * time (conversion proxy)."""
+        product_floor = 1e-40
+        product = max(rate * t_sec, product_floor)
+        product_ref = max(rate_ref * t_ref_s, product_floor)
+        return (np.log10(product) - np.log10(product_ref)) / self.reward_log_span
+
     def step(self, action):
         self.steps += 1
         action = np.clip(action, 0.0, 1.0).astype(np.float32)
         temperature = float(action[0])
         conc_diene_norm = float(action[1])
         conc_dienophile_norm = float(action[2])
+        residence_time_norm = float(action[3])
+        lewis_acid_norm = float(action[4])
+
+        t_sec = self.t_min_s + residence_time_norm * (self.t_max_s - self.t_min_s)
+        lewis_equiv = self.lewis_min_eq + lewis_acid_norm * (
+            self.lewis_max_eq - self.lewis_min_eq
+        )
 
         conditions = torch.tensor(
-            [temperature, conc_diene_norm, conc_dienophile_norm], device=self.device
+            [
+                temperature,
+                conc_diene_norm,
+                conc_dienophile_norm,
+                residence_time_norm,
+                lewis_acid_norm,
+            ],
+            device=self.device,
         )
         with torch.no_grad():
             pred_scaled = self.model(self.graph_data, conditions).view(-1)[0]
 
         predicted_delta_g = float((pred_scaled * self.ts_std) + self.ts_mean)
+        delta_g_eff = predicted_delta_g - self.lewis_delta_g_kcal_per_eq * lewis_equiv
+
         rate, k, temp_k, conc_diene_m, conc_dienophile_m = self._calculate_reaction_rate(
-            predicted_delta_g, temperature, conc_diene_norm, conc_dienophile_norm
+            delta_g_eff, temperature, conc_diene_norm, conc_dienophile_norm
         )
         rate_ref, k_ref = self._calculate_reference_rate(predicted_delta_g)
-        reward = float(self._normalized_log_reward(rate, rate_ref))
+        reward = float(
+            self._normalized_log_reward_time_weighted(
+                rate, t_sec, rate_ref, self.t_ref_s
+            )
+        )
         if temp_k > self.side_reaction_temp_k:
             reward -= self.side_reaction_penalty_per_k * (
                 temp_k - self.side_reaction_temp_k
@@ -519,6 +558,7 @@ class DielsAlderOptEnv(gym.Env):
         truncated = self.steps >= self.max_steps
         info = {
             "predicted_delta_g": predicted_delta_g,
+            "delta_g_eff": float(delta_g_eff),
             "rate": float(rate),
             "rate_ref": float(rate_ref),
             "k": float(k),
@@ -526,6 +566,8 @@ class DielsAlderOptEnv(gym.Env):
             "temp_k": float(temp_k),
             "conc_diene_m": float(conc_diene_m),
             "conc_dienophile_m": float(conc_dienophile_m),
+            "t_sec": float(t_sec),
+            "lewis_equiv": float(lewis_equiv),
         }
         return self.observation, float(reward), terminated, truncated, info
 
@@ -558,7 +600,7 @@ def build_graph_from_row(row, feature_stats: dict, node_dim: int | None = None, 
 
 
 def plot_optimization_landscape(env, steps=12):
-    """Plot reward over full 3D condition space (temp, conc_diene, conc_dienophile); color = reward."""
+    """Plot reward over 3D slice (temp, conc_diene, conc_dienophile); t_norm=0.5, lewis_norm=0."""
     temps = np.linspace(0.0, 1.0, steps)
     conc_diene = np.linspace(0.0, 1.0, steps)
     conc_dienophile = np.linspace(0.0, 1.0, steps)
@@ -567,21 +609,36 @@ def plot_optimization_landscape(env, steps=12):
     cd = cd.ravel()
     cph = cph.ravel()
     rewards = np.zeros(len(tt), dtype=float)
+    t_norm_fixed = 0.5
+    lewis_norm_fixed = 0.0
 
     env.model.eval()
     with torch.no_grad():
         for i in range(len(tt)):
             t, c_d, c_p = float(tt[i]), float(cd[i]), float(cph[i])
-            conditions = torch.tensor([t, c_d, c_p], device=env.device)
+            conditions = torch.tensor(
+                [t, c_d, c_p, t_norm_fixed, lewis_norm_fixed], device=env.device
+            )
             pred_scaled = env.model(env.graph_data, conditions).view(-1)[0]
             predicted_delta_g = float((pred_scaled * env.ts_std) + env.ts_mean)
+            lewis_equiv = env.lewis_min_eq + lewis_norm_fixed * (
+                env.lewis_max_eq - env.lewis_min_eq
+            )
+            delta_g_eff = predicted_delta_g - env.lewis_delta_g_kcal_per_eq * lewis_equiv
             rate, _, temp_k, _, _ = env._calculate_reaction_rate(
-                predicted_delta_g, t, c_d, c_p
+                delta_g_eff, t, c_d, c_p
             )
             rate_ref, _ = env._calculate_reference_rate(predicted_delta_g)
-            r = float(env._normalized_log_reward(rate, rate_ref))
+            t_sec = env.t_min_s + t_norm_fixed * (env.t_max_s - env.t_min_s)
+            r = float(
+                env._normalized_log_reward_time_weighted(
+                    rate, t_sec, rate_ref, env.t_ref_s
+                )
+            )
             if temp_k > env.side_reaction_temp_k:
-                r -= env.side_reaction_penalty_per_k * (temp_k - env.side_reaction_temp_k)
+                r -= env.side_reaction_penalty_per_k * (
+                    temp_k - env.side_reaction_temp_k
+                )
             rewards[i] = r
 
     fig = plt.figure(figsize=(10, 8))
@@ -591,7 +648,9 @@ def plot_optimization_landscape(env, steps=12):
     ax.set_xlabel("Temperature (scaled)")
     ax.set_ylabel("Conc diene (scaled)")
     ax.set_zlabel("Conc dienophile (scaled)")
-    ax.set_title("Optimization Landscape (3D: color = reward)")
+    ax.set_title(
+        "Optimization Landscape (3D slice; t_norm=0.5, lewis=0; color = reward)"
+    )
     plt.tight_layout()
     plt.show()
 
@@ -759,7 +818,7 @@ def main():
         f"dienophile={dienophile_id} ({dienophile_smi})"
     )
     print(
-        f"Best action (T_norm, C_diene_norm, C_dienophile_norm): {action}, "
+        f"Best action (T_norm, C_diene_norm, C_dienophile_norm, t_norm, lewis_norm): {action}, "
         f"reward: {reward:.4f}, info: {info}"
     )
 
