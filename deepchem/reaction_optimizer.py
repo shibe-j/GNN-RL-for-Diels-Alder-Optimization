@@ -11,7 +11,7 @@ import torch
 from gymnasium import spaces
 from rdkit import Chem
 from torch_geometric.data import Data
-from m import LayerNorm, TransformerConv, global_max_pool, global_mean_pool
+from torch_geometric.nn import LayerNorm, TransformerConv, global_max_pool, global_mean_pool
 from torch.nn import Dropout, Linear, ReLU, Sequential
 
 TARGET_COL = "Min_TSـall"
