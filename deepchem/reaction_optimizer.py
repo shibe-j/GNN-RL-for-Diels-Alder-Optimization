@@ -18,11 +18,42 @@ TARGET_COL = "Min_TSـall"
 DEFAULT_ROW_IDX = 0
 DEFAULT_DATA_FILE = "data/evaluation_data.csv"
 
+# Optional: stable-baselines3 algorithms for RL optimization (continuous action space)
 try:
-    from stable_baselines3 import PPO
+    from stable_baselines3 import A2C, PPO, SAC, TD3
+    _SB3_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
-    PPO = None
+    PPO = A2C = SAC = TD3 = None
+    _SB3_AVAILABLE = False
 
+# Algorithm registry: name -> (AlgoClass, default_extra_kwargs for .learn() or constructor)
+# All use MlpPolicy; env has Box action (0,1)^6 and Box observation.
+RL_ALGORITHMS = {}
+if _SB3_AVAILABLE:
+    RL_ALGORITHMS["ppo"] = (PPO, {"policy": "MlpPolicy", "verbose": 1})
+    RL_ALGORITHMS["a2c"] = (A2C, {"policy": "MlpPolicy", "verbose": 1})
+    RL_ALGORITHMS["sac"] = (
+        SAC,
+        {
+            "policy": "MlpPolicy",
+            "verbose": 1,
+            "buffer_size": 50_000,
+            "learning_starts": 1000,
+        },
+    )
+    RL_ALGORITHMS["td3"] = (
+        TD3,
+        {
+            "policy": "MlpPolicy",
+            "verbose": 1,
+            "buffer_size": 50_000,
+            "learning_starts": 1000,
+        },
+    )
+
+# Set which RL algorithm to use here: "ppo", "a2c", "sac", "td3"
+# (CLI --algorithm overrides this when provided.)
+RL_ALGORITHM = "ppo"
 
 def id_to_smiles(id_str, is_diene: bool = True, mapped: bool = False) -> str:
     lookup = {
@@ -693,12 +724,35 @@ def plot_optimization_landscape(env, steps=12):
     plt.show()
 
 
-def run_ppo_optimization(env, total_timesteps=5000):
-    if PPO is None:
-        raise ImportError("stable-baselines3 is required for PPO optimization.")
-    model = PPO("MlpPolicy", env, verbose=1)
+def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, **algo_kwargs):
+    """
+    Train an RL agent on the given env using the specified algorithm.
+
+    Supported algorithms (require stable-baselines3): ppo, a2c, sac, td3.
+    All use MlpPolicy and are suitable for continuous Box action spaces.
+
+    Returns:
+        The trained SB3 BaseAlgorithm (e.g. PPO, SAC) with .predict(obs, deterministic=...).
+    """
+    if not _SB3_AVAILABLE:
+        raise ImportError("stable-baselines3 is required for RL optimization.")
+    algo_key = algorithm.lower().strip()
+    if algo_key not in RL_ALGORITHMS:
+        raise ValueError(
+            f"Unknown algorithm '{algorithm}'. Choose from: {list(RL_ALGORITHMS.keys())}"
+        )
+    AlgoClass, defaults = RL_ALGORITHMS[algo_key]
+    kwargs = {**defaults, **algo_kwargs}
+    policy = kwargs.pop("policy", "MlpPolicy")
+    verbose = kwargs.pop("verbose", 1)
+    model = AlgoClass(policy, env, verbose=verbose, **kwargs)
     model.learn(total_timesteps=total_timesteps)
     return model
+
+
+def run_ppo_optimization(env, total_timesteps=5000):
+    """Convenience wrapper: train using PPO (same as run_rl_optimization(env, algorithm='ppo', ...))."""
+    return run_rl_optimization(env, algorithm="ppo", total_timesteps=total_timesteps)
 
 
 def _infer_edge_dim_from_state(state_dict) -> int | None:
@@ -782,7 +836,25 @@ def parse_args():
     parser.add_argument("--row-idx", type=int, default=DEFAULT_ROW_IDX)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     parser.add_argument("--max-steps", type=int, default=1)
-    parser.add_argument("--ppo-steps", type=int, default=5000)
+    parser.add_argument(
+        "--algorithm",
+        type=str,
+        default=None,
+        choices=["ppo", "a2c", "sac", "td3"],
+        help=f"RL algorithm (default: use RL_ALGORITHM in file, currently {RL_ALGORITHM!r}).",
+    )
+    parser.add_argument(
+        "--timesteps",
+        type=int,
+        default=5000,
+        help="Total training timesteps for the RL agent.",
+    )
+    parser.add_argument(
+        "--ppo-steps",
+        type=int,
+        default=None,
+        help="Deprecated alias for --timesteps; overrides --timesteps if set.",
+    )
     parser.add_argument("--plot", action="store_true")
     return parser.parse_args()
 
@@ -842,9 +914,13 @@ def main():
         max_steps=args.max_steps,
     )
 
-    ppo_model = run_ppo_optimization(env, total_timesteps=args.ppo_steps)
+    total_timesteps = args.ppo_steps if args.ppo_steps is not None else args.timesteps
+    algorithm = args.algorithm if args.algorithm is not None else RL_ALGORITHM
+    rl_model = run_rl_optimization(
+        env, algorithm=algorithm, total_timesteps=total_timesteps
+    )
     obs, _ = env.reset()
-    action, _ = ppo_model.predict(obs, deterministic=True)
+    action, _ = rl_model.predict(obs, deterministic=True)
     _, reward, _, _, info = env.step(action)
     diene_id = row["diene"]
     dienophile_id = row["dienophile"]
