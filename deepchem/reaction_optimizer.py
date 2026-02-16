@@ -11,7 +11,7 @@ import torch
 from gymnasium import spaces
 from rdkit import Chem
 from torch_geometric.data import Data
-from torch_geometric.nn import LayerNorm, TransformerConv, global_max_pool, global_mean_pool
+from m import LayerNorm, TransformerConv, global_max_pool, global_mean_pool
 from torch.nn import Dropout, Linear, ReLU, Sequential
 
 TARGET_COL = "Min_TSـall"
@@ -440,9 +440,11 @@ class DielsAlderOptEnv(gym.Env):
         self.device = device
         self.max_steps = max_steps
         self.steps = 0
-        # Thermal: [0,1] → 20°C to 39.6°C (DCM boiling point; dataset solvent)
+        # Thermal: [0,1] → 20°C to solvent-dependent max (see step())
         self.temp_min_k = 293.15
-        self.temp_max_k = 273.15 + 39.6  # 312.75 K
+        # Solvent choice: 0=DCM (39.6°C), 1=THF (66°C), 2=Toluene (110.6°C)
+        self.solvent_max_temp_c = (39.6, 66.0, 110.6)
+        self.temp_max_k = 273.15 + 39.6  # default DCM; updated in step() from solvent
         self.conc_min_m = 0.01
         self.conc_max_m = 5.0
         # Kinetic: [0,1] → 1 min to 24 hrs (seconds)
@@ -452,20 +454,28 @@ class DielsAlderOptEnv(gym.Env):
         # Catalytic: [0,1] → 0 to 0.5 eq Lewis acid
         self.lewis_min_eq = 0.0
         self.lewis_max_eq = 0.5
-        self.lewis_delta_g_kcal_per_eq = 4.0  # phenomenological: catalyst lowers barrier
+        # Saturation: reduction = 5.0 * (lewis_equiv / (lewis_equiv + 0.05))
+        self.lewis_saturation_kcal = 5.0
+        self.lewis_saturation_half_eq = 0.05
         self.side_reaction_temp_k = 400.0
         self.side_reaction_penalty_per_k = 0.01
         self.ref_temp_k = 298.15
         self.ref_conc_m = 1.0
         self.reward_log_span = 5.0
+        # Economic/efficiency penalties
+        self.penalty_conc_per_m = 0.01
+        self.penalty_time_per_day = 0.02
+        self.penalty_toluene = 0.05
+        # Retro-Diels-Alder equilibrium: ΔG° = -10 kcal/mol (exothermic)
+        self.delta_G_reaction_kcal = -10.0
 
         self.kb_j_per_k = 1.380649e-23
         self.h_j_s = 6.62607015e-34
         self.r_kcal_per_mol_k = 1.987204258e-3
         self.rate_floor = 1e-40
 
-        # Actions: T_norm, conc_diene_norm, conc_dienophile_norm, residence_time_norm, lewis_acid_norm
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(5,), dtype=np.float32)
+        # Actions: T_norm, conc_diene_norm, conc_dienophile_norm, residence_time_norm, lewis_acid_norm, solvent_norm (binned 0→DCM, 1→THF, 2→Toluene)
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(6,), dtype=np.float32)
 
         with torch.no_grad():
             self.model.eval()
@@ -479,6 +489,11 @@ class DielsAlderOptEnv(gym.Env):
         super().reset(seed=seed)
         self.steps = 0
         return self.observation, {}
+
+    def _equilibrium_fraction(self, temp_k):
+        """Retro-Diels-Alder: Keq = exp(-ΔG°/(R*T)); cap yield by Keq/(1+Keq)."""
+        Keq = np.exp(-self.delta_G_reaction_kcal / (self.r_kcal_per_mol_k * temp_k))
+        return Keq / (1.0 + Keq)
 
     def _calculate_reaction_rate(self, predicted_delta_g, temp_norm, conc_diene_norm, conc_dienophile_norm):
         temp_k = self.temp_min_k + temp_norm * (self.temp_max_k - self.temp_min_k)
@@ -503,10 +518,10 @@ class DielsAlderOptEnv(gym.Env):
         log_ref = np.log10(max(rate_ref, self.rate_floor))
         return (log_rate - log_ref) / self.reward_log_span
 
-    def _normalized_log_reward_time_weighted(self, rate, t_sec, rate_ref, t_ref_s):
-        """Reward based on rate * time (conversion proxy)."""
+    def _normalized_log_reward_time_weighted(self, rate, t_sec, rate_ref, t_ref_s, equilibrium_fraction=1.0):
+        """Reward based on rate * time (conversion proxy), capped by equilibrium fraction."""
         product_floor = 1e-40
-        product = max(rate * t_sec, product_floor)
+        product = max(rate * t_sec * equilibrium_fraction, product_floor)
         product_ref = max(rate_ref * t_ref_s, product_floor)
         return (np.log10(product) - np.log10(product_ref)) / self.reward_log_span
 
@@ -518,6 +533,10 @@ class DielsAlderOptEnv(gym.Env):
         conc_dienophile_norm = float(action[2])
         residence_time_norm = float(action[3])
         lewis_acid_norm = float(action[4])
+        # Bin 6th dimension to solvent: 0=DCM, 1=THF, 2=Toluene
+        solvent_norm = float(action[5])
+        solvent_idx = min(2, int(solvent_norm * 3))
+        self.temp_max_k = 273.15 + self.solvent_max_temp_c[solvent_idx]
 
         t_sec = self.t_min_s + residence_time_norm * (self.t_max_s - self.t_min_s)
         lewis_equiv = self.lewis_min_eq + lewis_acid_norm * (
@@ -538,21 +557,31 @@ class DielsAlderOptEnv(gym.Env):
             pred_scaled = self.model(self.graph_data, conditions).view(-1)[0]
 
         predicted_delta_g = float((pred_scaled * self.ts_std) + self.ts_mean)
-        delta_g_eff = predicted_delta_g - self.lewis_delta_g_kcal_per_eq * lewis_equiv
+        # Non-linear catalyst: saturation formula (diminishing returns)
+        lewis_reduction = self.lewis_saturation_kcal * (
+            lewis_equiv / (lewis_equiv + self.lewis_saturation_half_eq)
+        )
+        delta_g_eff = predicted_delta_g - lewis_reduction
 
         rate, k, temp_k, conc_diene_m, conc_dienophile_m = self._calculate_reaction_rate(
             delta_g_eff, temperature, conc_diene_norm, conc_dienophile_norm
         )
         rate_ref, k_ref = self._calculate_reference_rate(predicted_delta_g)
+        equilibrium_fraction = self._equilibrium_fraction(temp_k)
         reward = float(
             self._normalized_log_reward_time_weighted(
-                rate, t_sec, rate_ref, self.t_ref_s
+                rate, t_sec, rate_ref, self.t_ref_s, equilibrium_fraction
             )
         )
         if temp_k > self.side_reaction_temp_k:
             reward -= self.side_reaction_penalty_per_k * (
                 temp_k - self.side_reaction_temp_k
             )
+        # Economic/efficiency penalties
+        reward -= self.penalty_conc_per_m * (conc_diene_m + conc_dienophile_m)
+        reward -= self.penalty_time_per_day * (t_sec / 86400.0)
+        if solvent_idx == 2:
+            reward -= self.penalty_toluene  # Toluene: higher energy cost of removal
 
         terminated = False
         truncated = self.steps >= self.max_steps
@@ -568,6 +597,8 @@ class DielsAlderOptEnv(gym.Env):
             "conc_dienophile_m": float(conc_dienophile_m),
             "t_sec": float(t_sec),
             "lewis_equiv": float(lewis_equiv),
+            "solvent_idx": int(solvent_idx),
+            "equilibrium_fraction": float(equilibrium_fraction),
         }
         return self.observation, float(reward), terminated, truncated, info
 
@@ -600,7 +631,7 @@ def build_graph_from_row(row, feature_stats: dict, node_dim: int | None = None, 
 
 
 def plot_optimization_landscape(env, steps=12):
-    """Plot reward over 3D slice (temp, conc_diene, conc_dienophile); t_norm=0.5, lewis_norm=0."""
+    """Plot reward over 3D slice (temp, conc_diene, conc_dienophile); t_norm=0.5, lewis_norm=0, solvent=DCM."""
     temps = np.linspace(0.0, 1.0, steps)
     conc_diene = np.linspace(0.0, 1.0, steps)
     conc_dienophile = np.linspace(0.0, 1.0, steps)
@@ -611,6 +642,7 @@ def plot_optimization_landscape(env, steps=12):
     rewards = np.zeros(len(tt), dtype=float)
     t_norm_fixed = 0.5
     lewis_norm_fixed = 0.0
+    env.temp_max_k = 273.15 + env.solvent_max_temp_c[0]  # DCM for plot
 
     env.model.eval()
     with torch.no_grad():
@@ -624,21 +656,27 @@ def plot_optimization_landscape(env, steps=12):
             lewis_equiv = env.lewis_min_eq + lewis_norm_fixed * (
                 env.lewis_max_eq - env.lewis_min_eq
             )
-            delta_g_eff = predicted_delta_g - env.lewis_delta_g_kcal_per_eq * lewis_equiv
-            rate, _, temp_k, _, _ = env._calculate_reaction_rate(
+            lewis_reduction = env.lewis_saturation_kcal * (
+                lewis_equiv / (lewis_equiv + env.lewis_saturation_half_eq)
+            )
+            delta_g_eff = predicted_delta_g - lewis_reduction
+            rate, _, temp_k, conc_diene_m, conc_dienophile_m = env._calculate_reaction_rate(
                 delta_g_eff, t, c_d, c_p
             )
             rate_ref, _ = env._calculate_reference_rate(predicted_delta_g)
             t_sec = env.t_min_s + t_norm_fixed * (env.t_max_s - env.t_min_s)
+            eq_frac = env._equilibrium_fraction(temp_k)
             r = float(
                 env._normalized_log_reward_time_weighted(
-                    rate, t_sec, rate_ref, env.t_ref_s
+                    rate, t_sec, rate_ref, env.t_ref_s, eq_frac
                 )
             )
             if temp_k > env.side_reaction_temp_k:
                 r -= env.side_reaction_penalty_per_k * (
                     temp_k - env.side_reaction_temp_k
                 )
+            r -= env.penalty_conc_per_m * (conc_diene_m + conc_dienophile_m)
+            r -= env.penalty_time_per_day * (t_sec / 86400.0)
             rewards[i] = r
 
     fig = plt.figure(figsize=(10, 8))
@@ -817,9 +855,11 @@ def main():
         f"diene={diene_id} ({diene_smi}), "
         f"dienophile={dienophile_id} ({dienophile_smi})"
     )
+    solvent_names = ("DCM", "THF", "Toluene")
+    solvent_idx = info.get("solvent_idx", 0)
     print(
-        f"Best action (T_norm, C_diene_norm, C_dienophile_norm, t_norm, lewis_norm): {action}, "
-        f"reward: {reward:.4f}, info: {info}"
+        f"Best action (T_norm, C_diene_norm, C_dienophile_norm, t_norm, lewis_norm, solvent_norm): {action}, "
+        f"solvent={solvent_names[solvent_idx]}, reward: {reward:.4f}, info: {info}"
     )
 
     if args.plot:
