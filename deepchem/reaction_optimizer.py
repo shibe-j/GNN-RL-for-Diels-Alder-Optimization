@@ -14,6 +14,9 @@ from torch_geometric.data import Data
 from torch_geometric.nn import LayerNorm, TransformerConv, global_max_pool, global_mean_pool
 from torch.nn import Dropout, Linear, ReLU, Sequential
 
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.results_plotter import load_results, ts2xy
+
 TARGET_COL = "Min_TSـall"
 DEFAULT_ROW_IDX = 0
 DEFAULT_DATA_FILE = "data/evaluation_data.csv"
@@ -53,7 +56,7 @@ if _SB3_AVAILABLE:
 
 # Set which RL algorithm to use here: "ppo", "a2c", "sac", "td3"
 # (CLI --algorithm overrides this when provided.)
-RL_ALGORITHM = "ppo"
+RL_ALGORITHM = "td3"
 
 def id_to_smiles(id_str, is_diene: bool = True, mapped: bool = False) -> str:
     lookup = {
@@ -734,6 +737,9 @@ def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, **algo_kwarg
     Returns:
         The trained SB3 BaseAlgorithm (e.g. PPO, SAC) with .predict(obs, deterministic=...).
     """
+    log_dir = f"./logs/{algorithm}/"
+    os.makedirs(log_dir, exist_ok=True)
+    env = Monitor(env, log_dir)
     if not _SB3_AVAILABLE:
         raise ImportError("stable-baselines3 is required for RL optimization.")
     algo_key = algorithm.lower().strip()
@@ -858,6 +864,27 @@ def parse_args():
     parser.add_argument("--plot", action="store_true")
     return parser.parse_args()
 
+def plot_training_curve(log_dir, algo_name):
+    results = load_results(log_dir)
+    x, y = ts2xy(results, 'timesteps')
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, y)
+    plt.title(f"Learning Curve: {algo_name.upper()}")
+    plt.xlabel("Timesteps")
+    plt.ylabel("Reward")
+    plt.show()
+
+def plot_action_radar(action, algo_name):
+    labels = ['Temp', 'Conc D', 'Conc dPh', 'Time', 'Lewis Acid', 'Solvent']
+    angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
+    stats = np.concatenate((action, [action[0]]))
+    angles += angles[:1]
+    fig, ax = plt.subplots(figsize=(5, 5), subplot_kw=dict(polar=True))
+    ax.fill(angles, stats, alpha=0.3)
+    ax.set_xticklabels(labels)
+    plt.title(f"Condition Profile: {algo_name.upper()}")
+    plt.show()
+
 
 def main():
     args = parse_args()
@@ -939,7 +966,9 @@ def main():
     )
 
     if args.plot:
-        plot_optimization_landscape(env)
+        #plot_optimization_landscape(env)
+        plot_training_curve(f"./logs/{algorithm}/", algorithm)
+        plot_action_radar(action, algorithm)
 
 
 if __name__ == "__main__":
