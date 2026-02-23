@@ -946,6 +946,11 @@ def main():
     rl_model = run_rl_optimization(
         env, algorithm=algorithm, total_timesteps=total_timesteps
     )
+    save_dir = data_root / "trainedmodels"
+    save_dir.mkdir(parents=True, exist_ok=True)
+    model_name = Path(model_path).parent.name if model_path else "default"
+    save_path = save_dir / f"{model_name}_{algorithm}_row{args.row_idx}"
+    rl_model.save(str(save_path))
     obs, _ = env.reset()
     action, _ = rl_model.predict(obs, deterministic=True)
     _, reward, _, _, info = env.step(action)
