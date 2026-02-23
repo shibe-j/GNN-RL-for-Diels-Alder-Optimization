@@ -58,6 +58,10 @@ if _SB3_AVAILABLE:
 # (CLI --algorithm overrides this when provided.)
 RL_ALGORITHM = "td3"
 
+# Training length per algorithm (built-in; no CLI). PPO needs more steps (n_steps=2048).
+RL_TIMESTEPS = {"ppo": 100_000, "a2c": 20_000, "sac": 10_000, "td3": 10_000}
+
+
 def id_to_smiles(id_str, is_diene: bool = True, mapped: bool = False) -> str:
     lookup = {
         "1": "F",
@@ -495,10 +499,12 @@ class DielsAlderOptEnv(gym.Env):
         self.side_reaction_penalty_per_k = 0.01
         self.ref_temp_k = 298.15
         self.ref_conc_m = 1.0
+        self.lewis_ref_eq = 0.15
         self.reward_log_span = 5.0
-        # Economic/efficiency penalties
-        self.penalty_conc_per_m = 0.01
-        self.penalty_time_per_day = 0.02
+        # Economic/efficiency: quadratic-on-excess (favor interior conditions)
+        self.lambda_conc = 0.08
+        self.lambda_time = 0.08
+        self.lambda_lewis = 0.15
         self.penalty_toluene = 0.05
         # Retro-Diels-Alder equilibrium: ΔG° = -10 kcal/mol (exothermic)
         self.delta_G_reaction_kcal = -10.0
@@ -611,9 +617,13 @@ class DielsAlderOptEnv(gym.Env):
             reward -= self.side_reaction_penalty_per_k * (
                 temp_k - self.side_reaction_temp_k
             )
-        # Economic/efficiency penalties
-        reward -= self.penalty_conc_per_m * (conc_diene_m + conc_dienophile_m)
-        reward -= self.penalty_time_per_day * (t_sec / 86400.0)
+        # Quadratic-on-excess (above reference) to favor interior, economical conditions
+        r_d = conc_diene_m / self.ref_conc_m
+        r_ph = conc_dienophile_m / self.ref_conc_m
+        reward -= self.lambda_conc * (max(0.0, r_d - 1.0) ** 2 + max(0.0, r_ph - 1.0) ** 2)
+        r_t = t_sec / self.t_ref_s
+        reward -= self.lambda_time * max(0.0, r_t - 1.0) ** 2
+        reward -= self.lambda_lewis * (lewis_equiv**2)
         if solvent_idx == 2:
             reward -= self.penalty_toluene  # Toluene: higher energy cost of removal
 
@@ -709,8 +719,12 @@ def plot_optimization_landscape(env, steps=12):
                 r -= env.side_reaction_penalty_per_k * (
                     temp_k - env.side_reaction_temp_k
                 )
-            r -= env.penalty_conc_per_m * (conc_diene_m + conc_dienophile_m)
-            r -= env.penalty_time_per_day * (t_sec / 86400.0)
+            r_d = conc_diene_m / env.ref_conc_m
+            r_ph = conc_dienophile_m / env.ref_conc_m
+            r -= env.lambda_conc * (max(0.0, r_d - 1.0) ** 2 + max(0.0, r_ph - 1.0) ** 2)
+            r_t = t_sec / env.t_ref_s
+            r -= env.lambda_time * max(0.0, r_t - 1.0) ** 2
+            r -= env.lambda_lewis * (lewis_equiv**2)
             rewards[i] = r
 
     fig = plt.figure(figsize=(10, 8))
@@ -849,18 +863,6 @@ def parse_args():
         choices=["ppo", "a2c", "sac", "td3"],
         help=f"RL algorithm (default: use RL_ALGORITHM in file, currently {RL_ALGORITHM!r}).",
     )
-    parser.add_argument(
-        "--timesteps",
-        type=int,
-        default=5000,
-        help="Total training timesteps for the RL agent.",
-    )
-    parser.add_argument(
-        "--ppo-steps",
-        type=int,
-        default=None,
-        help="Deprecated alias for --timesteps; overrides --timesteps if set.",
-    )
     parser.add_argument("--plot", action="store_true")
     return parser.parse_args()
 
@@ -941,8 +943,8 @@ def main():
         max_steps=args.max_steps,
     )
 
-    total_timesteps = args.ppo_steps if args.ppo_steps is not None else args.timesteps
     algorithm = args.algorithm if args.algorithm is not None else RL_ALGORITHM
+    total_timesteps = RL_TIMESTEPS[algorithm]
     rl_model = run_rl_optimization(
         env, algorithm=algorithm, total_timesteps=total_timesteps
     )
