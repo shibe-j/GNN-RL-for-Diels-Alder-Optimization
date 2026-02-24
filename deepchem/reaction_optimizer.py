@@ -869,8 +869,11 @@ def parse_args():
 def plot_training_curve(log_dir, algo_name):
     results = load_results(log_dir)
     x, y = ts2xy(results, 'timesteps')
+    window = min(1000, max(1, len(y) // 50))
+    y_smooth = np.convolve(y, np.ones(window) / window, mode='valid')
+    x_smooth = x[window - 1 :]
     plt.figure(figsize=(8, 4))
-    plt.plot(x, y)
+    plt.plot(x_smooth, y_smooth)
     plt.title(f"Learning Curve: {algo_name.upper()}")
     plt.xlabel("Timesteps")
     plt.ylabel("Reward")
