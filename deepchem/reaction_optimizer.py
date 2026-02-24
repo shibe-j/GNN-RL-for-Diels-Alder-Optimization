@@ -873,7 +873,12 @@ def plot_training_curve(log_dir, algo_name):
     y_smooth = np.convolve(y, np.ones(window) / window, mode='valid')
     x_smooth = x[window - 1 :]
     plt.figure(figsize=(8, 4))
-    plt.plot(x_smooth, y_smooth)
+    # Plot raw rewards with low opacity for context
+    plt.plot(x, y, color="C0", alpha=0.2, linewidth=1)
+    # Plot smoothed rewards as the main curve
+    plt.plot(x_smooth, y_smooth, color="C0", linewidth=2)
+    # Use a fixed y-scale so different algorithms are easy to compare
+    plt.ylim(-50, 5)
     plt.title(f"Learning Curve: {algo_name.upper()}")
     plt.xlabel("Timesteps")
     plt.ylabel("Reward")
