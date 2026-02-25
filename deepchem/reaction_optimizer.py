@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import random
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -961,7 +962,7 @@ def main():
     model_name = Path(model_path).parent.name if model_path else "default"
     save_path = save_dir / f"{model_name}_{algorithm}_row{args.row_idx}"
     rl_model.save(str(save_path))
-    obs, _ = env.reset()
+    obs, _ = env.reset(seed=random.seed(42))
     action, _ = rl_model.predict(obs, deterministic=True)
     _, reward, _, _, info = env.step(action)
     diene_id = row["diene"]
