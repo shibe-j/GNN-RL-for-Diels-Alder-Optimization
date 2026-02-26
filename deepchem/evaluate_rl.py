@@ -115,9 +115,22 @@ def main():
 
             obs, _ = env.reset()
             action, _ = rl_model.predict(obs, deterministic=True)
-            _, rl_reward, _, _, _ = env.step(action)
-            
-            results[algo_key.upper()] = float(rl_reward)
+            _, rl_reward, _, _, rl_info = env.step(action)
+
+            rl_reward = float(rl_reward)
+            results[algo_key.upper()] = rl_reward
+
+            print(f"  {algo_key.upper()} reward: {rl_reward:.4f}")
+            print("  Action (normalized 0–1):", np.array(action, dtype=float))
+            print(
+                "  Conditions:",
+                f"T = {rl_info['temp_k']:.1f} K,",
+                f"[diene] = {rl_info['conc_diene_m']:.3f} M,",
+                f"[dienophile] = {rl_info['conc_dienophile_m']:.3f} M,",
+                f"t = {rl_info['t_sec']:.1f} s,",
+                f"Lewis acid = {rl_info['lewis_equiv']:.2f} eq,",
+                f"solvent_idx = {rl_info['solvent_idx']}",
+            )
         except Exception as e:
             print(f"Could not evaluate {algo_key}: {e}")
 
