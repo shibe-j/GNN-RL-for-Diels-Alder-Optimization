@@ -120,7 +120,13 @@ def main():
             rl_reward = float(rl_reward)
             results[algo_key.upper()] = rl_reward
 
+            # How often this algorithm beats random (out of N_RANDOM)
+            n_better = int((random_rewards < rl_reward).sum())
+            stds_above = (rl_reward - mean_r) / std_r if std_r > 0 else float("nan")
+
             print(f"  {algo_key.upper()} reward: {rl_reward:.4f}")
+            print(f"  {algo_key.upper()} beat {n_better}/{N_RANDOM} random trials.")
+            print(f"  {algo_key.upper()} is {stds_above:.2f} std above random mean.")
             print("  Action (normalized 0–1):", np.array(action, dtype=float))
             print(
                 "  Conditions:",
