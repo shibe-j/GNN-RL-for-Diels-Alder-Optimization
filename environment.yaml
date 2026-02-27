@@ -1,0 +1,20 @@
+name: asidiels
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - pandas
+  - matplotlib
+  - gymnasium
+  - rdkit
+  - setuptools
+  - wheel
+  - pip:
+      - torch==2.2.1
+      - torchvision==0.17.1
+      - torchaudio==2.2.1
+      - torch-geometric
+      - stable-baselines3[extra]

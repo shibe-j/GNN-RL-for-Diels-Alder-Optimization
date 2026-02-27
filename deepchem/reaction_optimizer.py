@@ -942,10 +942,17 @@ def main():
 
     data_path = data_root / args.data_file
     data_df = pd.read_csv(data_path)
-    if args.row_idx < 0 or args.row_idx >= len(data_df):
-        raise IndexError("row-idx is out of range for selected data file.")
-    row = data_df.iloc[args.row_idx]
+    n_rows = len(data_df)
+    if n_rows == 0:
+        raise ValueError(f"No rows found in data file: {data_path}")
 
+    # If a valid row index is provided, only optimize that row; otherwise use all rows.
+    if 0 <= args.row_idx < n_rows:
+        row_indices = [args.row_idx]
+    else:
+        row_indices = list(range(n_rows))
+
+    # Infer base model dimensions once from the chemistry model checkpoint (if available).
     state_dict = None
     expected_edge_dim = None
     expected_node_dim = None
@@ -953,63 +960,103 @@ def main():
         state_dict = torch.load(model_path, map_location=device)
         expected_edge_dim = _infer_edge_dim_from_state(state_dict)
         expected_node_dim = _infer_node_dim_from_state(state_dict)
+    # Determine which RL algorithms to train/evaluate.
+    if args.algorithm is not None:
+        algo_keys = [args.algorithm.lower().strip()]
+    else:
+        algo_keys = list(RL_ALGORITHMS.keys())
 
-    graph_data = build_graph_from_row(row, feature_stats, expected_node_dim, expected_edge_dim)
-    graph_data = graph_data.to(device)
-
-    edge_dim = graph_data.edge_attr.size(1)
-    node_dim = graph_data.x.size(1)
-    graph_data = _match_node_attr_dim(graph_data, node_dim)
-    graph_data = _match_edge_attr_dim(graph_data, edge_dim)
-
-    base_model = DielsAlderTransformer(input_dim=node_dim, edge_dim=edge_dim).to(device)
-    if state_dict is not None:
-        base_model.load_state_dict(state_dict)
-
-    model = ConditionAwareTransformer(base_model).to(device)
-
-    env = DielsAlderOptEnv(
-        graph_data=graph_data,
-        model=model,
-        ts_mean=ts_mean,
-        ts_std=ts_std,
-        device=device,
-        max_steps=args.max_steps,
-    )
-
-    algorithm = args.algorithm if args.algorithm is not None else RL_ALGORITHM
-    total_timesteps = RL_TIMESTEPS[algorithm]
-    rl_model = run_rl_optimization(
-        env, algorithm=algorithm, total_timesteps=total_timesteps
-    )
     save_dir = data_root / "trainedmodels"
     save_dir.mkdir(parents=True, exist_ok=True)
     model_name = Path(model_path).parent.name if model_path else "default"
-    save_path = save_dir / f"{model_name}_{algorithm}_row{args.row_idx}"
-    rl_model.save(str(save_path))
-    obs, _ = env.reset(seed=random.seed(42))
-    action, _ = rl_model.predict(obs, deterministic=True)
-    _, reward, _, _, info = env.step(action)
-    diene_id = row["diene"]
-    dienophile_id = row["dienophile"]
-    diene_smi = id_to_smiles(diene_id, is_diene=True)
-    dienophile_smi = id_to_smiles(dienophile_id, is_diene=False)
-    print(
-        f"Data file: {data_path} | row idx {args.row_idx} | "
-        f"diene={diene_id} ({diene_smi}), "
-        f"dienophile={dienophile_id} ({dienophile_smi})"
-    )
-    solvent_names = ("DCM", "THF", "Toluene")
-    solvent_idx = info.get("solvent_idx", 0)
-    print(
-        f"Best action (T_norm, C_diene_norm, C_dienophile_norm, t_norm, lewis_norm, solvent_norm): {action}, "
-        f"solvent={solvent_names[solvent_idx]}, reward: {reward:.4f}, info: {info}"
-    )
 
-    if args.plot:
-        #plot_optimization_landscape(env)
-        plot_training_curve(f"./logs/{algorithm}/", algorithm)
-        plot_action_radar(action, algorithm)
+    results = []
+
+    for row_idx in row_indices:
+        row = data_df.iloc[row_idx]
+
+        graph_data = build_graph_from_row(row, feature_stats, expected_node_dim, expected_edge_dim)
+        graph_data = graph_data.to(device)
+
+        edge_dim = graph_data.edge_attr.size(1)
+        node_dim = graph_data.x.size(1)
+        graph_data = _match_node_attr_dim(graph_data, node_dim)
+        graph_data = _match_edge_attr_dim(graph_data, edge_dim)
+
+        base_model = DielsAlderTransformer(input_dim=node_dim, edge_dim=edge_dim).to(device)
+        if state_dict is not None:
+            base_model.load_state_dict(state_dict)
+
+        model = ConditionAwareTransformer(base_model).to(device)
+
+        diene_id = row["diene"]
+        dienophile_id = row["dienophile"]
+        diene_smi = id_to_smiles(diene_id, is_diene=True)
+        dienophile_smi = id_to_smiles(dienophile_id, is_diene=False)
+
+        for algorithm in algo_keys:
+            env = DielsAlderOptEnv(
+                graph_data=graph_data,
+                model=model,
+                ts_mean=ts_mean,
+                ts_std=ts_std,
+                device=device,
+                max_steps=args.max_steps,
+            )
+
+            total_timesteps = RL_TIMESTEPS[algorithm]
+            rl_model = run_rl_optimization(
+                env, algorithm=algorithm, total_timesteps=total_timesteps
+            )
+
+            save_path = save_dir / f"{model_name}_{algorithm}_row{row_idx}"
+            rl_model.save(str(save_path))
+
+            obs, _ = env.reset(seed=random.seed(42))
+            action, _ = rl_model.predict(obs, deterministic=True)
+            _, reward, _, _, info = env.step(action)
+
+            solvent_names = ("DCM", "THF", "Toluene")
+            solvent_idx = info.get("solvent_idx", 0)
+
+            print(
+                f"Data file: {data_path} | row idx {row_idx} | algo={algorithm} | "
+                f"diene={diene_id} ({diene_smi}), "
+                f"dienophile={dienophile_id} ({dienophile_smi})"
+            )
+            print(
+                f"Best action (T_norm, C_diene_norm, C_dienophile_norm, t_norm, lewis_norm, solvent_norm): {action}, "
+                f"solvent={solvent_names[solvent_idx]}, reward: {reward:.4f}, info: {info}"
+            )
+
+            results.append(
+                {
+                    "data_file": str(data_path),
+                    "row_idx": row_idx,
+                    "algorithm": algorithm,
+                    "reward": float(reward),
+                    "diene_id": diene_id,
+                    "dienophile_id": dienophile_id,
+                    "T_norm": float(action[0]),
+                    "conc_diene_norm": float(action[1]),
+                    "conc_dienophile_norm": float(action[2]),
+                    "time_norm": float(action[3]),
+                    "lewis_norm": float(action[4]),
+                    "solvent_norm": float(action[5]),
+                    **{k: v for k, v in info.items()},
+                }
+            )
+
+            if args.plot and row_idx == row_indices[0]:
+                # Only plot for the first row per run to keep plotting manageable.
+                plot_training_curve(f"./logs/{algorithm}/", algorithm)
+                plot_action_radar(action, algorithm)
+
+    if results:
+        results_df = pd.DataFrame(results)
+        summary_path = save_dir / f"{model_name}_rl_summary.csv"
+        results_df.to_csv(summary_path, index=False)
+        print(f"Saved RL training/evaluation summary to {summary_path}")
 
 
 if __name__ == "__main__":
