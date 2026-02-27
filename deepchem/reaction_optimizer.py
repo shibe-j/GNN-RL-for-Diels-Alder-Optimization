@@ -502,6 +502,8 @@ class DielsAlderOptEnv(gym.Env):
         self.ref_conc_m = 1.0
         self.lewis_ref_eq = 0.15
         self.reward_log_span = 5.0
+        # Weighting factor for explicit ΔG‡-based reward shaping (kept modest for realism)
+        self.delta_g_reward_weight = 0.25
         # Economic/efficiency: quadratic-on-excess (favor interior conditions)
         self.lambda_conc = 0.08
         self.lambda_time = 0.08
@@ -566,6 +568,23 @@ class DielsAlderOptEnv(gym.Env):
         product_ref = max(rate_ref * t_ref_s, product_floor)
         return (np.log10(product) - np.log10(product_ref)) / self.reward_log_span
 
+    def _normalized_delta_g_reward(self, delta_g_eff):
+        """
+        Additional shaping term that directly rewards lower effective ΔG‡.
+
+        We convert ΔΔG‡ (relative to ts_mean) into an approximate log10(k_ratio)
+        at the reference temperature via Eyring, then normalize by reward_log_span.
+        This keeps the term on the same rough scale as the rate-based reward
+        while modestly increasing the influence of the GNN ΔG‡ predictions.
+        """
+        delta_g_ref = self.ts_mean
+        # Positive when the barrier is lower than the reference value
+        dg_diff = delta_g_ref - delta_g_eff
+        # log10(k2/k1) ≈ -ΔΔG‡ / (2.303 * R * T); sign already in dg_diff
+        denom = max(2.303 * self.r_kcal_per_mol_k * self.ref_temp_k, 1e-8)
+        log10_k_ratio = dg_diff / denom
+        return log10_k_ratio / self.reward_log_span
+
     def step(self, action):
         self.steps += 1
         action = np.clip(action, 0.0, 1.0).astype(np.float32)
@@ -609,10 +628,16 @@ class DielsAlderOptEnv(gym.Env):
         )
         rate_ref, k_ref = self._calculate_reference_rate(predicted_delta_g)
         equilibrium_fraction = self._equilibrium_fraction(temp_k)
-        reward = float(
+        base_reward = float(
             self._normalized_log_reward_time_weighted(
                 rate, t_sec, rate_ref, self.t_ref_s, equilibrium_fraction
             )
+        )
+        # Blend the original rate/time-based reward with a mild, explicit ΔG‡ term
+        delta_g_reward = float(self._normalized_delta_g_reward(delta_g_eff))
+        reward = (
+            (1.0 - self.delta_g_reward_weight) * base_reward
+            + self.delta_g_reward_weight * delta_g_reward
         )
         if temp_k > self.side_reaction_temp_k:
             reward -= self.side_reaction_penalty_per_k * (
