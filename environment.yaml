@@ -1,0 +1,23 @@
+name: reaction_env
+channels:
+  - pytorch
+  - nvidia
+  - pyg
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - rdkit>=2025.09
+  - pytorch>=2.3
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=11.8
+  - pyg
+  - stable-baselines3  # Now installed directly from conda-forge
+  - pandas
+  - numpy
+  - scikit-learn
+  - matplotlib
+  - gymnasium
+  - jupyterlab
+  - mamba  # Included to speed up the environment solve in Docker
