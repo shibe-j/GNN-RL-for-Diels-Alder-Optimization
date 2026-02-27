@@ -10,6 +10,7 @@ dependencies:
   - matplotlib
   - gymnasium
   - rdkit
+  - scikit-learn
   - setuptools
   - wheel
   - pip:
