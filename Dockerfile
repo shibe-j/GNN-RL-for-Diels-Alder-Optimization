@@ -17,4 +17,4 @@ RUN conda env create -f environment.yaml && conda clean -afy
 
 COPY . .
 
-# No CMD: run manually. After shell/SSH: conda activate asidiels && python3 -m deepchem.reaction_optimizer ...
+CMD ["bash", "-c", "sleep infinity"]

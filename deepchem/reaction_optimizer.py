@@ -61,7 +61,7 @@ if _SB3_AVAILABLE:
 RL_ALGORITHM = "td3"
 
 # Training length per algorithm (built-in; no CLI). PPO needs more steps (n_steps=2048).
-RL_TIMESTEPS = {"ppo": 100_000, "a2c": 20_000, "sac": 10_000, "td3": 10_000}
+RL_TIMESTEPS = {"ppo": 50_000, "a2c": 20_000, "sac": 10_000, "td3": 10_000}
 
 
 def id_to_smiles(id_str, is_diene: bool = True, mapped: bool = False) -> str:
@@ -692,6 +692,13 @@ class DielsAlderVecEnv(VecEnv):
     """
     Vectorized env that runs n_envs copies of the same reaction in parallel.
     Batches GNN forward passes for speed on GPU; optional mixed precision (AMP).
+
+    Conforms to Stable-Baselines3 VecEnv API (see guide/vec_envs.html):
+    - reset() returns observation only (no tuple); reset_infos updated on reset.
+    - step_wait() returns (obs, rewards, dones, infos); dones = terminated or truncated.
+    - On done: terminal_observation in infos, auto-reset (_steps[i]=0), obs is first of next episode.
+    - infos[i]["TimeLimit.truncated"] = truncated (for bootstrapping).
+    - get_attr, set_attr, env_method, env_is_wrapped, close, get_images implemented.
     """
 
     def __init__(
@@ -714,7 +721,6 @@ class DielsAlderVecEnv(VecEnv):
             max_steps=max_steps,
         )
         obs_single = self._template_env.observation
-        obs_dim = obs_single.shape[0] if obs_single.ndim == 1 else obs_single.size
         observation_space = self._template_env.observation_space
         action_space = self._template_env.action_space
         super().__init__(n_envs, observation_space, action_space)
@@ -724,12 +730,14 @@ class DielsAlderVecEnv(VecEnv):
         self.use_amp = use_amp and (device.type == "cuda")
         self._steps = np.zeros(n_envs, dtype=np.int64)
         self._obs = np.tile(obs_single.ravel(), (n_envs, 1)).astype(np.float32)
+        self._pending_actions = np.zeros((n_envs, 6), dtype=np.float32)
 
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             np.random.seed(seed)
         self._steps.fill(0)
-        return self._obs.copy(), None
+        self.reset_infos = [{} for _ in range(self.num_envs)]
+        return self._obs.copy()
 
     def step_async(self, actions):
         self._pending_actions = np.asarray(actions, dtype=np.float32)
@@ -737,7 +745,6 @@ class DielsAlderVecEnv(VecEnv):
     def step_wait(self):
         actions = self._pending_actions
         n_envs = self.num_envs
-        # Build batched conditions (n_envs, 5) — no solvent in model input
         conditions = torch.tensor(
             actions[:, :5],
             device=self.device,
@@ -752,7 +759,7 @@ class DielsAlderVecEnv(VecEnv):
                 pred_scaled = self.model(self.graph_data, conditions)
         pred_scaled = pred_scaled.view(n_envs, -1).cpu().numpy()
 
-        rewards = np.zeros(n_envs, dtype=np.float64)
+        rewards = np.zeros(n_envs, dtype=np.float32)
         dones = np.zeros(n_envs, dtype=bool)
         infos = [{} for _ in range(n_envs)]
 
@@ -763,10 +770,46 @@ class DielsAlderVecEnv(VecEnv):
             rewards[i] = r
             dones[i] = term or trunc
             infos[i] = {**info, "TimeLimit.truncated": trunc}
-            self._steps[i] += 1
+            if dones[i]:
+                infos[i]["terminal_observation"] = self._obs[i].copy()
+                self._steps[i] = 0
+            else:
+                self._steps[i] += 1
 
-        # SB3 expects (obs, rewards, dones, infos)
         return self._obs.copy(), rewards, dones, infos
+
+    def _indices(self, indices):
+        if indices is None:
+            return list(range(self.num_envs))
+        if isinstance(indices, int):
+            return [indices]
+        return list(indices)
+
+    def close(self):
+        pass
+
+    def get_attr(self, attr_name, indices=None):
+        idx = self._indices(indices)
+        val = getattr(self._template_env, attr_name, None)
+        return [val] * len(idx)
+
+    def set_attr(self, attr_name, value, indices=None):
+        setattr(self._template_env, attr_name, value)
+
+    def env_method(self, method_name, *method_args, indices=None, **method_kwargs):
+        idx = self._indices(indices)
+        method = getattr(self._template_env, method_name, None)
+        if method is None or not callable(method):
+            raise AttributeError(f"env has no callable method {method_name!r}")
+        result = method(*method_args, **method_kwargs)
+        return [result] * len(idx)
+
+    def env_is_wrapped(self, wrapper_class, indices=None):
+        idx = self._indices(indices)
+        return [False] * len(idx)
+
+    def get_images(self):
+        return [None] * self.num_envs
 
 
 def load_stats(data_root: Path, stats_path: str | None):
@@ -1114,7 +1157,14 @@ def main():
 
         model = ConditionAwareTransformer(base_model).to(device)
         if getattr(args, "compile", False) and hasattr(torch, "compile"):
-            model = torch.compile(model, mode="reduce-overhead")
+            try:
+                model = torch.compile(model, mode="reduce-overhead")
+            except Exception as e:  # pragma: no cover - best-effort optimization
+                print(
+                    f"Warning: torch.compile failed ({e!r}); "
+                    "falling back to eager mode. You may need a C compiler in the image "
+                    "to use --compile."
+                )
 
         diene_id = row["diene"]
         dienophile_id = row["dienophile"]
@@ -1164,7 +1214,7 @@ def main():
             save_path = save_dir / f"{model_name}_{algorithm}_row{row_idx}"
             rl_model.save(str(save_path))
 
-            obs, _ = eval_env.reset(seed=random.seed(42))
+            obs, _ = eval_env.reset(seed=42)
             action, _ = rl_model.predict(obs, deterministic=True)
             _, reward, _, _, info = eval_env.step(action)
 
