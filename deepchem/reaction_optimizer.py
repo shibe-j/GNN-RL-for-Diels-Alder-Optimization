@@ -17,6 +17,7 @@ from torch.nn import Dropout, Linear, ReLU, Sequential
 
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.results_plotter import load_results, ts2xy
+from stable_baselines3.common.vec_env import VecEnv
 
 TARGET_COL = "Min_TSـall"
 DEFAULT_ROW_IDX = 0
@@ -455,6 +456,9 @@ class ConditionAwareTransformer(torch.nn.Module):
         pooled = self._pooled_graph_features(data)
         if conditions.dim() == 1:
             conditions = conditions.unsqueeze(0)
+        # Support batched conditions: expand pooled (1, D) to (N, D) for (N, 5) conditions
+        if conditions.size(0) > 1 and pooled.size(0) == 1:
+            pooled = pooled.expand(conditions.size(0), -1)
         x = torch.cat([pooled, conditions], dim=-1)
         return self.conditioned_mlp(x)
 
@@ -585,15 +589,16 @@ class DielsAlderOptEnv(gym.Env):
         log10_k_ratio = dg_diff / denom
         return log10_k_ratio / self.reward_log_span
 
-    def step(self, action):
-        self.steps += 1
+    def _compute_reward_and_info(self, pred_scaled_item: float, action: np.ndarray, current_steps: int):
+        """Compute reward, terminated, truncated, and info from model prediction and action.
+        Used by step() and by DielsAlderVecEnv for batched reward computation.
+        """
         action = np.clip(action, 0.0, 1.0).astype(np.float32)
         temperature = float(action[0])
         conc_diene_norm = float(action[1])
         conc_dienophile_norm = float(action[2])
         residence_time_norm = float(action[3])
         lewis_acid_norm = float(action[4])
-        # Bin 6th dimension to solvent: 0=DCM, 1=THF, 2=Toluene
         solvent_norm = float(action[5])
         solvent_idx = min(2, int(solvent_norm * 3))
         self.temp_max_k = 273.15 + self.solvent_max_temp_c[solvent_idx]
@@ -603,21 +608,7 @@ class DielsAlderOptEnv(gym.Env):
             self.lewis_max_eq - self.lewis_min_eq
         )
 
-        conditions = torch.tensor(
-            [
-                temperature,
-                conc_diene_norm,
-                conc_dienophile_norm,
-                residence_time_norm,
-                lewis_acid_norm,
-            ],
-            device=self.device,
-        )
-        with torch.no_grad():
-            pred_scaled = self.model(self.graph_data, conditions).view(-1)[0]
-
-        predicted_delta_g = float((pred_scaled * self.ts_std) + self.ts_mean)
-        # Non-linear catalyst: saturation formula (diminishing returns)
+        predicted_delta_g = float((pred_scaled_item * self.ts_std) + self.ts_mean)
         lewis_reduction = self.lewis_saturation_kcal * (
             lewis_equiv / (lewis_equiv + self.lewis_saturation_half_eq)
         )
@@ -633,7 +624,6 @@ class DielsAlderOptEnv(gym.Env):
                 rate, t_sec, rate_ref, self.t_ref_s, equilibrium_fraction
             )
         )
-        # Blend the original rate/time-based reward with a mild, explicit ΔG‡ term
         delta_g_reward = float(self._normalized_delta_g_reward(delta_g_eff))
         reward = (
             (1.0 - self.delta_g_reward_weight) * base_reward
@@ -643,7 +633,6 @@ class DielsAlderOptEnv(gym.Env):
             reward -= self.side_reaction_penalty_per_k * (
                 temp_k - self.side_reaction_temp_k
             )
-        # Quadratic-on-excess (above reference) to favor interior, economical conditions
         r_d = conc_diene_m / self.ref_conc_m
         r_ph = conc_dienophile_m / self.ref_conc_m
         reward -= self.lambda_conc * (max(0.0, r_d - 1.0) ** 2 + max(0.0, r_ph - 1.0) ** 2)
@@ -651,10 +640,10 @@ class DielsAlderOptEnv(gym.Env):
         reward -= self.lambda_time * max(0.0, r_t - 1.0) ** 2
         reward -= self.lambda_lewis * (lewis_equiv**2)
         if solvent_idx == 2:
-            reward -= self.penalty_toluene  # Toluene: higher energy cost of removal
+            reward -= self.penalty_toluene
 
         terminated = False
-        truncated = self.steps >= self.max_steps
+        truncated = current_steps >= self.max_steps
         info = {
             "predicted_delta_g": predicted_delta_g,
             "delta_g_eff": float(delta_g_eff),
@@ -670,7 +659,114 @@ class DielsAlderOptEnv(gym.Env):
             "solvent_idx": int(solvent_idx),
             "equilibrium_fraction": float(equilibrium_fraction),
         }
-        return self.observation, float(reward), terminated, truncated, info
+        return float(reward), terminated, truncated, info
+
+    def step(self, action):
+        self.steps += 1
+        action = np.clip(action, 0.0, 1.0).astype(np.float32)
+        temperature = float(action[0])
+        conc_diene_norm = float(action[1])
+        conc_dienophile_norm = float(action[2])
+        residence_time_norm = float(action[3])
+        lewis_acid_norm = float(action[4])
+        conditions = torch.tensor(
+            [
+                temperature,
+                conc_diene_norm,
+                conc_dienophile_norm,
+                residence_time_norm,
+                lewis_acid_norm,
+            ],
+            device=self.device,
+        )
+        with torch.no_grad():
+            pred_scaled = self.model(self.graph_data, conditions).view(-1)[0]
+        pred_scaled_item = float(pred_scaled.cpu().item())
+        reward, terminated, truncated, info = self._compute_reward_and_info(
+            pred_scaled_item, action, self.steps
+        )
+        return self.observation, reward, terminated, truncated, info
+
+
+class DielsAlderVecEnv(VecEnv):
+    """
+    Vectorized env that runs n_envs copies of the same reaction in parallel.
+    Batches GNN forward passes for speed on GPU; optional mixed precision (AMP).
+    """
+
+    def __init__(
+        self,
+        graph_data,
+        model,
+        ts_mean,
+        ts_std,
+        device,
+        max_steps=1,
+        n_envs=4,
+        use_amp=False,
+    ):
+        self._template_env = DielsAlderOptEnv(
+            graph_data=graph_data,
+            model=model,
+            ts_mean=ts_mean,
+            ts_std=ts_std,
+            device=device,
+            max_steps=max_steps,
+        )
+        obs_single = self._template_env.observation
+        obs_dim = obs_single.shape[0] if obs_single.ndim == 1 else obs_single.size
+        observation_space = self._template_env.observation_space
+        action_space = self._template_env.action_space
+        super().__init__(n_envs, observation_space, action_space)
+        self.graph_data = graph_data.to(device)
+        self.model = model
+        self.device = device
+        self.use_amp = use_amp and (device.type == "cuda")
+        self._steps = np.zeros(n_envs, dtype=np.int64)
+        self._obs = np.tile(obs_single.ravel(), (n_envs, 1)).astype(np.float32)
+
+    def reset(self, *, seed=None, options=None):
+        if seed is not None:
+            np.random.seed(seed)
+        self._steps.fill(0)
+        return self._obs.copy(), None
+
+    def step_async(self, actions):
+        self._pending_actions = np.asarray(actions, dtype=np.float32)
+
+    def step_wait(self):
+        actions = self._pending_actions
+        n_envs = self.num_envs
+        # Build batched conditions (n_envs, 5) — no solvent in model input
+        conditions = torch.tensor(
+            actions[:, :5],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.model.eval()
+        with torch.no_grad():
+            if self.use_amp:
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    pred_scaled = self.model(self.graph_data, conditions)
+            else:
+                pred_scaled = self.model(self.graph_data, conditions)
+        pred_scaled = pred_scaled.view(n_envs, -1).cpu().numpy()
+
+        rewards = np.zeros(n_envs, dtype=np.float64)
+        dones = np.zeros(n_envs, dtype=bool)
+        infos = [{} for _ in range(n_envs)]
+
+        for i in range(n_envs):
+            r, term, trunc, info = self._template_env._compute_reward_and_info(
+                float(pred_scaled[i, 0]), actions[i], int(self._steps[i])
+            )
+            rewards[i] = r
+            dones[i] = term or trunc
+            infos[i] = {**info, "TimeLimit.truncated": trunc}
+            self._steps[i] += 1
+
+        # SB3 expects (obs, rewards, dones, infos)
+        return self._obs.copy(), rewards, dones, infos
 
 
 def load_stats(data_root: Path, stats_path: str | None):
@@ -773,13 +869,22 @@ def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, **algo_kwarg
 
     Supported algorithms (require stable-baselines3): ppo, a2c, sac, td3.
     All use MlpPolicy and are suitable for continuous Box action spaces.
+    env can be a single Gym env or a VecEnv (e.g. DielsAlderVecEnv).
 
     Returns:
         The trained SB3 BaseAlgorithm (e.g. PPO, SAC) with .predict(obs, deterministic=...).
     """
     log_dir = f"./logs/{algorithm}/"
     os.makedirs(log_dir, exist_ok=True)
-    env = Monitor(env, log_dir)
+    is_vec = hasattr(env, "num_envs") and getattr(env, "num_envs", 0) > 1
+    if is_vec:
+        try:
+            from stable_baselines3.common.vec_env import VecMonitor
+            env = VecMonitor(env, log_dir)
+        except ImportError:
+            pass
+    else:
+        env = Monitor(env, log_dir)
     if not _SB3_AVAILABLE:
         raise ImportError("stable-baselines3 is required for RL optimization.")
     algo_key = algorithm.lower().strip()
@@ -791,6 +896,10 @@ def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, **algo_kwarg
     kwargs = {**defaults, **algo_kwargs}
     policy = kwargs.pop("policy", "MlpPolicy")
     verbose = kwargs.pop("verbose", 1)
+    # PPO: use larger n_steps when using vec env for better GPU utilization
+    n_envs = getattr(env, "num_envs", 1)
+    if algo_key == "ppo" and n_envs > 1 and "n_steps" not in algo_kwargs:
+        kwargs.setdefault("n_steps", max(2048, (2048 // n_envs) * n_envs))
     model = AlgoClass(policy, env, verbose=verbose, **kwargs)
     model.learn(total_timesteps=total_timesteps)
     return model
@@ -890,6 +999,22 @@ def parse_args():
         help=f"RL algorithm (default: use RL_ALGORITHM in file, currently {RL_ALGORITHM!r}).",
     )
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=1,
+        help="Number of parallel envs for RL (vectorized env with batched GNN). Use 8–32 on GPU for fastest training; all other behavior unchanged.",
+    )
+    parser.add_argument(
+        "--use-amp",
+        action="store_true",
+        help="Use mixed precision (FP16) for GNN forward in vectorized env (faster on H200/Ampere+).",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Compile the condition model with torch.compile (PyTorch 2+).",
+    )
     return parser.parse_args()
 
 def plot_training_curve(log_dir, algo_name):
@@ -988,21 +1113,48 @@ def main():
             base_model.load_state_dict(state_dict)
 
         model = ConditionAwareTransformer(base_model).to(device)
+        if getattr(args, "compile", False) and hasattr(torch, "compile"):
+            model = torch.compile(model, mode="reduce-overhead")
 
         diene_id = row["diene"]
         dienophile_id = row["dienophile"]
         diene_smi = id_to_smiles(diene_id, is_diene=True)
         dienophile_smi = id_to_smiles(dienophile_id, is_diene=False)
 
+        n_envs = getattr(args, "n_envs", 1) or 1
+        use_amp = getattr(args, "use_amp", False)
+
         for algorithm in algo_keys:
-            env = DielsAlderOptEnv(
-                graph_data=graph_data,
-                model=model,
-                ts_mean=ts_mean,
-                ts_std=ts_std,
-                device=device,
-                max_steps=args.max_steps,
-            )
+            if n_envs > 1:
+                env = DielsAlderVecEnv(
+                    graph_data=graph_data,
+                    model=model,
+                    ts_mean=ts_mean,
+                    ts_std=ts_std,
+                    device=device,
+                    max_steps=args.max_steps,
+                    n_envs=n_envs,
+                    use_amp=use_amp,
+                )
+                # For evaluation we use the first env's observation and a single step
+                eval_env = DielsAlderOptEnv(
+                    graph_data=graph_data,
+                    model=model,
+                    ts_mean=ts_mean,
+                    ts_std=ts_std,
+                    device=device,
+                    max_steps=args.max_steps,
+                )
+            else:
+                env = DielsAlderOptEnv(
+                    graph_data=graph_data,
+                    model=model,
+                    ts_mean=ts_mean,
+                    ts_std=ts_std,
+                    device=device,
+                    max_steps=args.max_steps,
+                )
+                eval_env = env
 
             total_timesteps = RL_TIMESTEPS[algorithm]
             rl_model = run_rl_optimization(
@@ -1012,9 +1164,9 @@ def main():
             save_path = save_dir / f"{model_name}_{algorithm}_row{row_idx}"
             rl_model.save(str(save_path))
 
-            obs, _ = env.reset(seed=random.seed(42))
+            obs, _ = eval_env.reset(seed=random.seed(42))
             action, _ = rl_model.predict(obs, deterministic=True)
-            _, reward, _, _, info = env.step(action)
+            _, reward, _, _, info = eval_env.step(action)
 
             solvent_names = ("DCM", "THF", "Toluene")
             solvent_idx = info.get("solvent_idx", 0)
