@@ -63,6 +63,9 @@ RL_ALGORITHM = "td3"
 # Training length per algorithm (built-in; no CLI). PPO needs more steps (n_steps=2048).
 RL_TIMESTEPS = {"ppo": 50_000, "a2c": 20_000, "sac": 10_000, "td3": 10_000}
 
+# Number of random trials for vs-random evaluation report (evaluate.txt).
+N_RANDOM = 30
+
 
 def id_to_smiles(id_str, is_diene: bool = True, mapped: bool = False) -> str:
     lookup = {
@@ -906,7 +909,7 @@ def plot_optimization_landscape(env, steps=12):
     plt.show()
 
 
-def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, **algo_kwargs):
+def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, log_dir=None, **algo_kwargs):
     """
     Train an RL agent on the given env using the specified algorithm.
 
@@ -917,7 +920,8 @@ def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, **algo_kwarg
     Returns:
         The trained SB3 BaseAlgorithm (e.g. PPO, SAC) with .predict(obs, deterministic=...).
     """
-    log_dir = f"./logs/{algorithm}/"
+    if log_dir is None:
+        log_dir = f"./logs/{algorithm}/"
     os.makedirs(log_dir, exist_ok=True)
     is_vec = hasattr(env, "num_envs") and getattr(env, "num_envs", 0) > 1
     if is_vec:
@@ -1060,25 +1064,26 @@ def parse_args():
     )
     return parser.parse_args()
 
-def plot_training_curve(log_dir, algo_name):
+def plot_training_curve(log_dir, algo_name, save_path=None):
     results = load_results(log_dir)
     x, y = ts2xy(results, 'timesteps')
     window = min(1000, max(1, len(y) // 50))
     y_smooth = np.convolve(y, np.ones(window) / window, mode='valid')
     x_smooth = x[window - 1 :]
     plt.figure(figsize=(8, 4))
-    # Plot raw rewards with low opacity for context
     plt.plot(x, y, color="C0", alpha=0.2, linewidth=1)
-    # Plot smoothed rewards as the main curve
     plt.plot(x_smooth, y_smooth, color="C0", linewidth=2)
-    # Use a fixed y-scale so different algorithms are easy to compare
     plt.ylim(-50, 5)
     plt.title(f"Learning Curve: {algo_name.upper()}")
     plt.xlabel("Timesteps")
     plt.ylabel("Reward")
-    plt.show()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+    else:
+        plt.show()
 
-def plot_action_radar(action, algo_name):
+def plot_action_radar(action, algo_name, save_path=None):
     labels = ['Temp', 'Conc D', 'Conc dPh', 'Time', 'Lewis Acid', 'Solvent']
     angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
     stats = np.concatenate((action, [action[0]]))
@@ -1087,7 +1092,36 @@ def plot_action_radar(action, algo_name):
     ax.fill(angles, stats, alpha=0.3)
     ax.set_xticklabels(labels)
     plt.title(f"Condition Profile: {algo_name.upper()}")
-    plt.show()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+    else:
+        plt.show()
+
+
+def save_comparison_plot(results, mean_r, std_r, save_path, row_idx):
+    """Bar chart: Random vs each RL algo (same as evaluate_rl create_comparison_plot). Saves to save_path."""
+    names = list(results.keys())
+    values = list(results.values())
+    plt.figure(figsize=(10, 6))
+    colors = []
+    for name in names:
+        if name == "Random":
+            colors.append("gray")
+        else:
+            colors.append("#2ca02c" if results[name] >= mean_r else "#d62728")
+    plt.bar(names, values, color=colors, alpha=0.8, edgecolor="black")
+    plt.errorbar(0, mean_r, yerr=std_r, fmt="none", ecolor="black", capsize=10)
+    plt.axhline(y=mean_r, color="black", linestyle="--", alpha=0.5)
+    plt.title(f"RL Algorithm Performance vs. Random Baseline (Row {row_idx})", fontsize=14)
+    plt.ylabel("Reward (Standardized Yield)", fontsize=12)
+    plt.xlabel("Algorithm", fontsize=12)
+    plt.grid(axis="y", linestyle=":", alpha=0.7)
+    for i, (name, val) in enumerate(zip(names, values)):
+        plt.text(i, val + (max(values) * 0.01), f"{val:.4f}", ha="center", va="bottom", fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
 
 
 def main():
@@ -1137,8 +1171,8 @@ def main():
     save_dir = data_root / "trainedmodels"
     save_dir.mkdir(parents=True, exist_ok=True)
     model_name = Path(model_path).parent.name if model_path else "default"
-
-    results = []
+    saved_graphs_root = data_root / "saved_graphs"
+    solvent_names = ("DCM", "THF", "Toluene")
 
     for row_idx in row_indices:
         row = data_df.iloc[row_idx]
@@ -1174,6 +1208,31 @@ def main():
         n_envs = getattr(args, "n_envs", 1) or 1
         use_amp = getattr(args, "use_amp", False)
 
+        # Single env for evaluation and random baseline (same reaction)
+        eval_env = DielsAlderOptEnv(
+            graph_data=graph_data,
+            model=model,
+            ts_mean=ts_mean,
+            ts_std=ts_std,
+            device=device,
+            max_steps=args.max_steps,
+        )
+        rxn_dir = saved_graphs_root / f"rxn_{row_idx}"
+        rxn_dir.mkdir(parents=True, exist_ok=True)
+
+        # Random baseline for vs-random report
+        random_rewards = []
+        for _ in range(N_RANDOM):
+            eval_env.reset()
+            action_rand = eval_env.action_space.sample()
+            _, r, _, _, _ = eval_env.step(action_rand)
+            random_rewards.append(r)
+        random_rewards = np.array(random_rewards, dtype=np.float64)
+        mean_r = float(np.mean(random_rewards))
+        std_r = float(np.std(random_rewards, ddof=1)) if len(random_rewards) > 1 else 0.0
+        results_dict = {"Random": mean_r}
+        eval_lines = []
+
         for algorithm in algo_keys:
             if n_envs > 1:
                 env = DielsAlderVecEnv(
@@ -1186,15 +1245,6 @@ def main():
                     n_envs=n_envs,
                     use_amp=use_amp,
                 )
-                # For evaluation we use the first env's observation and a single step
-                eval_env = DielsAlderOptEnv(
-                    graph_data=graph_data,
-                    model=model,
-                    ts_mean=ts_mean,
-                    ts_std=ts_std,
-                    device=device,
-                    max_steps=args.max_steps,
-                )
             else:
                 env = DielsAlderOptEnv(
                     graph_data=graph_data,
@@ -1204,11 +1254,11 @@ def main():
                     device=device,
                     max_steps=args.max_steps,
                 )
-                eval_env = env
 
+            row_log_dir = f"./logs/row{row_idx}_{algorithm}/"
             total_timesteps = RL_TIMESTEPS[algorithm]
             rl_model = run_rl_optimization(
-                env, algorithm=algorithm, total_timesteps=total_timesteps
+                env, algorithm=algorithm, total_timesteps=total_timesteps, log_dir=row_log_dir
             )
 
             save_path = save_dir / f"{model_name}_{algorithm}_row{row_idx}"
@@ -1217,10 +1267,30 @@ def main():
             obs, _ = eval_env.reset(seed=42)
             action, _ = rl_model.predict(obs, deterministic=True)
             _, reward, _, _, info = eval_env.step(action)
+            reward = float(reward)
 
-            solvent_names = ("DCM", "THF", "Toluene")
+            results_dict[algorithm.upper()] = reward
+            n_better = int((random_rewards < reward).sum())
+            stds_above = (reward - mean_r) / std_r if std_r > 0 else float("nan")
+            eval_lines.append(f"{algorithm.upper()} reward: {reward:.4f}")
+            eval_lines.append(f"{algorithm.upper()} beat {n_better}/{N_RANDOM} random trials.")
+            eval_lines.append(f"{algorithm.upper()} is {stds_above:.2f} std above random mean.")
+            eval_lines.append("Action (normalized 0–1): " + str(np.asarray(action, dtype=float).tolist()))
+            eval_lines.append(
+                "Conditions: "
+                f"T = {info['temp_k']:.1f} K, "
+                f"[diene] = {info['conc_diene_m']:.3f} M, "
+                f"[dienophile] = {info['conc_dienophile_m']:.3f} M, "
+                f"t = {info['t_sec']:.1f} s, "
+                f"Lewis acid = {info['lewis_equiv']:.2f} eq, "
+                f"solvent_idx = {info['solvent_idx']}"
+            )
+            eval_lines.append("")
+
+            plot_training_curve(row_log_dir, algorithm, save_path=rxn_dir / f"{algorithm}_training.png")
+            plot_action_radar(action, algorithm, save_path=rxn_dir / f"{algorithm}_radar.png")
+
             solvent_idx = info.get("solvent_idx", 0)
-
             print(
                 f"Data file: {data_path} | row idx {row_idx} | algo={algorithm} | "
                 f"diene={diene_id} ({diene_smi}), "
@@ -1231,34 +1301,13 @@ def main():
                 f"solvent={solvent_names[solvent_idx]}, reward: {reward:.4f}, info: {info}"
             )
 
-            results.append(
-                {
-                    "data_file": str(data_path),
-                    "row_idx": row_idx,
-                    "algorithm": algorithm,
-                    "reward": float(reward),
-                    "diene_id": diene_id,
-                    "dienophile_id": dienophile_id,
-                    "T_norm": float(action[0]),
-                    "conc_diene_norm": float(action[1]),
-                    "conc_dienophile_norm": float(action[2]),
-                    "time_norm": float(action[3]),
-                    "lewis_norm": float(action[4]),
-                    "solvent_norm": float(action[5]),
-                    **{k: v for k, v in info.items()},
-                }
-            )
-
-            if args.plot and row_idx == row_indices[0]:
-                # Only plot for the first row per run to keep plotting manageable.
-                plot_training_curve(f"./logs/{algorithm}/", algorithm)
-                plot_action_radar(action, algorithm)
-
-    if results:
-        results_df = pd.DataFrame(results)
-        summary_path = save_dir / f"{model_name}_rl_summary.csv"
-        results_df.to_csv(summary_path, index=False)
-        print(f"Saved RL training/evaluation summary to {summary_path}")
+        # Write evaluate.txt (vs-random report)
+        with open(rxn_dir / "evaluate.txt", "w", encoding="utf-8") as f:
+            f.write(f"Row {row_idx} | diene={diene_id} | dienophile={dienophile_id}\n")
+            f.write(f"Random baseline: mean reward = {mean_r:.4f} (std = {std_r:.4f}, N = {N_RANDOM})\n\n")
+            f.write("\n".join(eval_lines))
+        save_comparison_plot(results_dict, mean_r, std_r, rxn_dir / "algorithm_comparison.png", row_idx)
+        print(f"Saved graphs and evaluate.txt to {rxn_dir}")
 
 
 if __name__ == "__main__":
