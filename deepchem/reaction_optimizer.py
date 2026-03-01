@@ -1,8 +1,11 @@
 import argparse
+import concurrent.futures
 import json
 import os
 from pathlib import Path
 import random
+import subprocess
+import sys
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -17,6 +20,12 @@ from torch.nn import Dropout, Linear, ReLU, Sequential
 
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.results_plotter import load_results, ts2xy
+
+from evaluate_rl import (
+    build_evaluation_text,
+    create_comparison_plot,
+    evaluate_saved_models_for_env,
+)
 
 TARGET_COL = "Min_TSـall"
 DEFAULT_ROW_IDX = 0
@@ -60,7 +69,7 @@ if _SB3_AVAILABLE:
 RL_ALGORITHM = "td3"
 
 # Training length per algorithm (built-in; no CLI). PPO needs more steps (n_steps=2048).
-RL_TIMESTEPS = {"ppo": 100_000, "a2c": 20_000, "sac": 10_000, "td3": 10_000}
+RL_TIMESTEPS = {"ppo": 50_000, "a2c": 20_000, "sac": 10_000, "td3": 10_000}
 
 
 def id_to_smiles(id_str, is_diene: bool = True, mapped: bool = False) -> str:
@@ -767,7 +776,7 @@ def plot_optimization_landscape(env, steps=12):
     plt.show()
 
 
-def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, **algo_kwargs):
+def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, log_dir=None, **algo_kwargs):
     """
     Train an RL agent on the given env using the specified algorithm.
 
@@ -777,7 +786,8 @@ def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, **algo_kwarg
     Returns:
         The trained SB3 BaseAlgorithm (e.g. PPO, SAC) with .predict(obs, deterministic=...).
     """
-    log_dir = f"./logs/{algorithm}/"
+    if log_dir is None:
+        log_dir = f"./logs/{algorithm}/"
     os.makedirs(log_dir, exist_ok=True)
     env = Monitor(env, log_dir)
     if not _SB3_AVAILABLE:
@@ -890,13 +900,42 @@ def parse_args():
         help=f"RL algorithm (default: use RL_ALGORITHM in file, currently {RL_ALGORITHM!r}).",
     )
     parser.add_argument("--plot", action="store_true")
+    parser.add_argument(
+        "--cloud-batch",
+        action="store_true",
+        help="Train/evaluate all rows and emit per-reaction graph artifacts.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel workers for cloud batch subprocess orchestration.",
+    )
+    parser.add_argument(
+        "--graphs-dir",
+        default="graphs",
+        help="Output directory for per-reaction graph folders.",
+    )
+    parser.add_argument(
+        "--n-random",
+        type=int,
+        default=30,
+        help="Random trials used for evaluate-RL baseline.",
+    )
+    parser.add_argument(
+        "--emit-artifacts",
+        action="store_true",
+        help="Emit training/radar/comparison graphs and evaluation.txt for processed rows.",
+    )
     return parser.parse_args()
 
-def plot_training_curve(log_dir, algo_name):
+def plot_training_curve(log_dir, algo_name, output_path: Path | None = None, show: bool = True):
     results = load_results(log_dir)
-    x, y = ts2xy(results, 'timesteps')
+    x, y = ts2xy(results, "timesteps")
+    if len(y) == 0:
+        return
     window = min(1000, max(1, len(y) // 50))
-    y_smooth = np.convolve(y, np.ones(window) / window, mode='valid')
+    y_smooth = np.convolve(y, np.ones(window) / window, mode="valid")
     x_smooth = x[window - 1 :]
     plt.figure(figsize=(8, 4))
     # Plot raw rewards with low opacity for context
@@ -908,18 +947,275 @@ def plot_training_curve(log_dir, algo_name):
     plt.title(f"Learning Curve: {algo_name.upper()}")
     plt.xlabel("Timesteps")
     plt.ylabel("Reward")
-    plt.show()
+    plt.tight_layout()
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_path)
+    if show:
+        plt.show()
+    plt.close()
 
-def plot_action_radar(action, algo_name):
-    labels = ['Temp', 'Conc D', 'Conc dPh', 'Time', 'Lewis Acid', 'Solvent']
-    angles = np.linspace(0, 2*np.pi, len(labels), endpoint=False).tolist()
+def plot_action_radar(action, algo_name, output_path: Path | None = None, show: bool = True):
+    labels = ["Temp", "Conc D", "Conc dPh", "Time", "Lewis Acid", "Solvent"]
+    angles = np.linspace(0, 2 * np.pi, len(labels), endpoint=False).tolist()
     stats = np.concatenate((action, [action[0]]))
     angles += angles[:1]
-    fig, ax = plt.subplots(figsize=(5, 5), subplot_kw=dict(polar=True))
+    _, ax = plt.subplots(figsize=(5, 5), subplot_kw=dict(polar=True))
+    ax.plot(angles, stats)
     ax.fill(angles, stats, alpha=0.3)
+    ax.set_xticks(angles[:-1])
     ax.set_xticklabels(labels)
     plt.title(f"Condition Profile: {algo_name.upper()}")
-    plt.show()
+    plt.tight_layout()
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(output_path)
+    if show:
+        plt.show()
+    plt.close()
+
+
+def _configure_torch_runtime(device: torch.device):
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
+
+def _build_row_model_and_graph(
+    row,
+    feature_stats,
+    expected_node_dim,
+    expected_edge_dim,
+    state_dict,
+    device,
+):
+    graph_data = build_graph_from_row(row, feature_stats, expected_node_dim, expected_edge_dim)
+    graph_data = graph_data.to(device)
+    edge_dim = graph_data.edge_attr.size(1)
+    node_dim = graph_data.x.size(1)
+    graph_data = _match_node_attr_dim(graph_data, node_dim)
+    graph_data = _match_edge_attr_dim(graph_data, edge_dim)
+    base_model = DielsAlderTransformer(input_dim=node_dim, edge_dim=edge_dim).to(device)
+    if state_dict is not None:
+        base_model.load_state_dict(state_dict)
+    model = ConditionAwareTransformer(base_model).to(device)
+    return graph_data, model
+
+
+def _process_single_row(
+    row_idx,
+    row,
+    algo_keys,
+    ts_mean,
+    ts_std,
+    device,
+    feature_stats,
+    expected_node_dim,
+    expected_edge_dim,
+    state_dict,
+    max_steps,
+    data_path,
+    save_dir,
+    model_name,
+    logs_root,
+    emit_artifacts,
+    graphs_root,
+    n_random,
+):
+    graph_data, model = _build_row_model_and_graph(
+        row=row,
+        feature_stats=feature_stats,
+        expected_node_dim=expected_node_dim,
+        expected_edge_dim=expected_edge_dim,
+        state_dict=state_dict,
+        device=device,
+    )
+
+    diene_id = row["diene"]
+    dienophile_id = row["dienophile"]
+    diene_smi = id_to_smiles(diene_id, is_diene=True)
+    dienophile_smi = id_to_smiles(dienophile_id, is_diene=False)
+
+    row_results = []
+    reaction_dir = graphs_root / f"reaction_{row_idx}"
+    if emit_artifacts:
+        reaction_dir.mkdir(parents=True, exist_ok=True)
+
+    for algorithm in algo_keys:
+        env = DielsAlderOptEnv(
+            graph_data=graph_data,
+            model=model,
+            ts_mean=ts_mean,
+            ts_std=ts_std,
+            device=device,
+            max_steps=max_steps,
+        )
+        total_timesteps = RL_TIMESTEPS[algorithm]
+        algo_log_dir = logs_root / f"reaction_{row_idx}" / algorithm
+        rl_model = run_rl_optimization(
+            env,
+            algorithm=algorithm,
+            total_timesteps=total_timesteps,
+            log_dir=str(algo_log_dir),
+        )
+
+        save_path = save_dir / f"{model_name}_{algorithm}_row{row_idx}"
+        rl_model.save(str(save_path))
+
+        obs, _ = env.reset(seed=42)
+        action, _ = rl_model.predict(obs, deterministic=True)
+        _, reward, _, _, info = env.step(action)
+
+        solvent_names = ("DCM", "THF", "Toluene")
+        solvent_idx = info.get("solvent_idx", 0)
+
+        print(
+            f"Data file: {data_path} | row idx {row_idx} | algo={algorithm} | "
+            f"diene={diene_id} ({diene_smi}), "
+            f"dienophile={dienophile_id} ({dienophile_smi})"
+        )
+        print(
+            f"Best action (T_norm, C_diene_norm, C_dienophile_norm, t_norm, lewis_norm, solvent_norm): {action}, "
+            f"solvent={solvent_names[solvent_idx]}, reward: {reward:.4f}, info: {info}"
+        )
+
+        row_results.append(
+            {
+                "data_file": str(data_path),
+                "row_idx": row_idx,
+                "algorithm": algorithm,
+                "reward": float(reward),
+                "diene_id": diene_id,
+                "dienophile_id": dienophile_id,
+                "T_norm": float(action[0]),
+                "conc_diene_norm": float(action[1]),
+                "conc_dienophile_norm": float(action[2]),
+                "time_norm": float(action[3]),
+                "lewis_norm": float(action[4]),
+                "solvent_norm": float(action[5]),
+                **{k: v for k, v in info.items()},
+            }
+        )
+
+        if emit_artifacts:
+            plot_training_curve(
+                str(algo_log_dir),
+                algorithm,
+                output_path=reaction_dir / f"training_{algorithm}.png",
+                show=False,
+            )
+            plot_action_radar(
+                action,
+                algorithm,
+                output_path=reaction_dir / f"radar_{algorithm}.png",
+                show=False,
+            )
+
+    if emit_artifacts:
+        eval_env = DielsAlderOptEnv(
+            graph_data=graph_data,
+            model=model,
+            ts_mean=ts_mean,
+            ts_std=ts_std,
+            device=device,
+            max_steps=1,
+        )
+        eval_result = evaluate_saved_models_for_env(
+            env=eval_env,
+            rl_algorithms=RL_ALGORITHMS,
+            model_dir=save_dir,
+            model_prefix=model_name,
+            row_idx=row_idx,
+            algo_keys=algo_keys,
+            n_random=n_random,
+        )
+        create_comparison_plot(
+            eval_result["results"],
+            eval_result["random_mean"],
+            eval_result["random_std"],
+            row_idx=row_idx,
+            output_path=reaction_dir / "evaluate_rl_comparison.png",
+            show=False,
+        )
+        evaluation_text = build_evaluation_text(row_idx, Path(data_path), save_dir, eval_result)
+        (reaction_dir / "evaluation.txt").write_text(evaluation_text, encoding="utf-8")
+        row_summary = {"row_idx": row_idx, "results": row_results}
+        row_results_dir = graphs_root / "_row_results"
+        row_results_dir.mkdir(parents=True, exist_ok=True)
+        (row_results_dir / f"row_{row_idx}.json").write_text(
+            json.dumps(row_summary, indent=2),
+            encoding="utf-8",
+        )
+
+    return row_results
+
+
+def _build_row_subprocess_command(args, row_idx: int):
+    script_path = Path(__file__).resolve()
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--data-root",
+        args.data_root,
+        "--data-file",
+        args.data_file,
+        "--row-idx",
+        str(row_idx),
+        "--device",
+        args.device,
+        "--max-steps",
+        str(args.max_steps),
+        "--graphs-dir",
+        args.graphs_dir,
+        "--n-random",
+        str(args.n_random),
+        "--emit-artifacts",
+    ]
+    if args.model_path:
+        cmd.extend(["--model-path", args.model_path])
+    if args.stats_path:
+        cmd.extend(["--stats-path", args.stats_path])
+    return cmd
+
+
+def _run_cloud_batch_subprocesses(args, row_indices):
+    row_indices = list(row_indices)
+    workers = max(1, int(args.workers))
+
+    def _run_row(row_idx: int):
+        cmd = _build_row_subprocess_command(args, row_idx)
+        proc = subprocess.run(cmd, text=True, capture_output=True)
+        return row_idx, proc.returncode, proc.stdout, proc.stderr
+
+    failures = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_run_row, row_idx) for row_idx in row_indices]
+        for future in concurrent.futures.as_completed(futures):
+            row_idx, return_code, stdout, stderr = future.result()
+            if return_code != 0:
+                failures.append((row_idx, return_code, stderr))
+            elif stdout.strip():
+                print(f"[row {row_idx}] completed")
+
+    if failures:
+        preview = "\n".join(
+            f"row {idx} failed (exit {code}): {err.strip()[:300]}"
+            for idx, code, err in failures[:5]
+        )
+        raise RuntimeError(f"Cloud batch subprocess failures:\n{preview}")
+
+
+def _collect_artifact_row_results(graphs_root: Path, row_indices):
+    all_results = []
+    row_results_dir = graphs_root / "_row_results"
+    for row_idx in row_indices:
+        summary_path = row_results_dir / f"row_{row_idx}.json"
+        if not summary_path.exists():
+            continue
+        with open(summary_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        all_results.extend(payload.get("results", []))
+    return all_results
 
 
 def main():
@@ -931,9 +1227,9 @@ def main():
     else:
         device = torch.device(args.device)
 
-    model_path, stats_path = _resolve_run_paths(
-        data_root, args.model_path, args.stats_path
-    )
+    _configure_torch_runtime(device)
+
+    model_path, stats_path = _resolve_run_paths(data_root, args.model_path, args.stats_path)
 
     stats = load_stats(data_root, stats_path)
     ts_mean = float(stats["ts_mean"])
@@ -946,8 +1242,9 @@ def main():
     if n_rows == 0:
         raise ValueError(f"No rows found in data file: {data_path}")
 
-    # If a valid row index is provided, only optimize that row; otherwise use all rows.
-    if 0 <= args.row_idx < n_rows:
+    if args.cloud_batch:
+        row_indices = list(range(n_rows))
+    elif 0 <= args.row_idx < n_rows:
         row_indices = [args.row_idx]
     else:
         row_indices = list(range(n_rows))
@@ -961,7 +1258,11 @@ def main():
         expected_edge_dim = _infer_edge_dim_from_state(state_dict)
         expected_node_dim = _infer_node_dim_from_state(state_dict)
     # Determine which RL algorithms to train/evaluate.
-    if args.algorithm is not None:
+    if args.cloud_batch:
+        algo_keys = list(RL_ALGORITHMS.keys())
+        if args.algorithm is not None:
+            print("Ignoring --algorithm because --cloud-batch evaluates all algorithms.")
+    elif args.algorithm is not None:
         algo_keys = [args.algorithm.lower().strip()]
     else:
         algo_keys = list(RL_ALGORITHMS.keys())
@@ -969,88 +1270,58 @@ def main():
     save_dir = data_root / "trainedmodels"
     save_dir.mkdir(parents=True, exist_ok=True)
     model_name = Path(model_path).parent.name if model_path else "default"
+    logs_root = Path("logs")
+    graphs_root = Path(args.graphs_dir)
+    emit_artifacts = bool(args.emit_artifacts or args.cloud_batch)
 
     results = []
 
-    for row_idx in row_indices:
-        row = data_df.iloc[row_idx]
-
-        graph_data = build_graph_from_row(row, feature_stats, expected_node_dim, expected_edge_dim)
-        graph_data = graph_data.to(device)
-
-        edge_dim = graph_data.edge_attr.size(1)
-        node_dim = graph_data.x.size(1)
-        graph_data = _match_node_attr_dim(graph_data, node_dim)
-        graph_data = _match_edge_attr_dim(graph_data, edge_dim)
-
-        base_model = DielsAlderTransformer(input_dim=node_dim, edge_dim=edge_dim).to(device)
-        if state_dict is not None:
-            base_model.load_state_dict(state_dict)
-
-        model = ConditionAwareTransformer(base_model).to(device)
-
-        diene_id = row["diene"]
-        dienophile_id = row["dienophile"]
-        diene_smi = id_to_smiles(diene_id, is_diene=True)
-        dienophile_smi = id_to_smiles(dienophile_id, is_diene=False)
-
-        for algorithm in algo_keys:
-            env = DielsAlderOptEnv(
-                graph_data=graph_data,
-                model=model,
+    if args.cloud_batch and args.workers > 1:
+        if device.type == "cuda":
+            print(
+                "CUDA device detected: consider workers=1 for one GPU, "
+                "or set workers to available GPUs for multi-GPU nodes."
+            )
+        _run_cloud_batch_subprocesses(args, row_indices)
+        results = _collect_artifact_row_results(graphs_root, row_indices)
+    else:
+        for row_idx in row_indices:
+            row = data_df.iloc[row_idx]
+            row_results = _process_single_row(
+                row_idx=row_idx,
+                row=row,
+                algo_keys=algo_keys,
                 ts_mean=ts_mean,
                 ts_std=ts_std,
                 device=device,
+                feature_stats=feature_stats,
+                expected_node_dim=expected_node_dim,
+                expected_edge_dim=expected_edge_dim,
+                state_dict=state_dict,
                 max_steps=args.max_steps,
+                data_path=data_path,
+                save_dir=save_dir,
+                model_name=model_name,
+                logs_root=logs_root,
+                emit_artifacts=emit_artifacts,
+                graphs_root=graphs_root,
+                n_random=args.n_random,
             )
-
-            total_timesteps = RL_TIMESTEPS[algorithm]
-            rl_model = run_rl_optimization(
-                env, algorithm=algorithm, total_timesteps=total_timesteps
-            )
-
-            save_path = save_dir / f"{model_name}_{algorithm}_row{row_idx}"
-            rl_model.save(str(save_path))
-
-            obs, _ = env.reset(seed=random.seed(42))
-            action, _ = rl_model.predict(obs, deterministic=True)
-            _, reward, _, _, info = env.step(action)
-
-            solvent_names = ("DCM", "THF", "Toluene")
-            solvent_idx = info.get("solvent_idx", 0)
-
-            print(
-                f"Data file: {data_path} | row idx {row_idx} | algo={algorithm} | "
-                f"diene={diene_id} ({diene_smi}), "
-                f"dienophile={dienophile_id} ({dienophile_smi})"
-            )
-            print(
-                f"Best action (T_norm, C_diene_norm, C_dienophile_norm, t_norm, lewis_norm, solvent_norm): {action}, "
-                f"solvent={solvent_names[solvent_idx]}, reward: {reward:.4f}, info: {info}"
-            )
-
-            results.append(
-                {
-                    "data_file": str(data_path),
-                    "row_idx": row_idx,
-                    "algorithm": algorithm,
-                    "reward": float(reward),
-                    "diene_id": diene_id,
-                    "dienophile_id": dienophile_id,
-                    "T_norm": float(action[0]),
-                    "conc_diene_norm": float(action[1]),
-                    "conc_dienophile_norm": float(action[2]),
-                    "time_norm": float(action[3]),
-                    "lewis_norm": float(action[4]),
-                    "solvent_norm": float(action[5]),
-                    **{k: v for k, v in info.items()},
-                }
-            )
-
-            if args.plot and row_idx == row_indices[0]:
-                # Only plot for the first row per run to keep plotting manageable.
-                plot_training_curve(f"./logs/{algorithm}/", algorithm)
-                plot_action_radar(action, algorithm)
+            results.extend(row_results)
+            if args.plot and row_idx == row_indices[0] and row_results:
+                first_algo = row_results[0]["algorithm"]
+                first_action = np.array(
+                    [
+                        row_results[0]["T_norm"],
+                        row_results[0]["conc_diene_norm"],
+                        row_results[0]["conc_dienophile_norm"],
+                        row_results[0]["time_norm"],
+                        row_results[0]["lewis_norm"],
+                        row_results[0]["solvent_norm"],
+                    ]
+                )
+                plot_training_curve(str(logs_root / f"reaction_{row_idx}" / first_algo), first_algo)
+                plot_action_radar(first_action, first_algo)
 
     if results:
         results_df = pd.DataFrame(results)
