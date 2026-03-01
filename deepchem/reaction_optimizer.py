@@ -1266,7 +1266,8 @@ def _collect_artifact_row_results(graphs_root: Path, row_indices):
 
 def main():
     args = parse_args()
-    data_root = Path(args.data_root)
+    data_root = Path(args.data_root).resolve()
+    args.data_root = str(data_root)
 
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1316,8 +1317,11 @@ def main():
     save_dir = data_root / "trainedmodels"
     save_dir.mkdir(parents=True, exist_ok=True)
     model_name = Path(model_path).parent.name if model_path else "default"
-    logs_root = Path("logs")
-    graphs_root = Path(args.graphs_dir)
+    logs_root = data_root / "logs"
+    raw_graphs_root = Path(args.graphs_dir)
+    graphs_root = raw_graphs_root if raw_graphs_root.is_absolute() else (data_root / raw_graphs_root)
+    graphs_root = graphs_root.resolve()
+    args.graphs_dir = str(graphs_root)
     emit_artifacts = bool(args.emit_artifacts or args.cloud_batch)
 
     results = []
