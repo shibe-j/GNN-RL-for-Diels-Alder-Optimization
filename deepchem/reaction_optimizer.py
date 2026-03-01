@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import subprocess
 import sys
+import threading
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
@@ -20,6 +21,7 @@ from torch.nn import Dropout, Linear, ReLU, Sequential
 
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.results_plotter import load_results, ts2xy
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 
 from evaluate_rl import (
     build_evaluation_text,
@@ -776,7 +778,15 @@ def plot_optimization_landscape(env, steps=12):
     plt.show()
 
 
-def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, log_dir=None, **algo_kwargs):
+def run_rl_optimization(
+    env,
+    algorithm="ppo",
+    total_timesteps=5000,
+    log_dir=None,
+    n_envs: int = 1,
+    env_builder=None,
+    **algo_kwargs,
+):
     """
     Train an RL agent on the given env using the specified algorithm.
 
@@ -789,7 +799,17 @@ def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, log_dir=None
     if log_dir is None:
         log_dir = f"./logs/{algorithm}/"
     os.makedirs(log_dir, exist_ok=True)
-    env = Monitor(env, log_dir)
+
+    n_envs = max(1, int(n_envs))
+    if n_envs > 1:
+        if env_builder is None:
+            raise ValueError("env_builder is required when n_envs > 1.")
+
+        env_fns = [env_builder for _ in range(n_envs)]
+        vec_env = DummyVecEnv(env_fns)
+        train_env = VecMonitor(vec_env, log_dir)
+    else:
+        train_env = Monitor(env, log_dir)
     if not _SB3_AVAILABLE:
         raise ImportError("stable-baselines3 is required for RL optimization.")
     algo_key = algorithm.lower().strip()
@@ -801,7 +821,7 @@ def run_rl_optimization(env, algorithm="ppo", total_timesteps=5000, log_dir=None
     kwargs = {**defaults, **algo_kwargs}
     policy = kwargs.pop("policy", "MlpPolicy")
     verbose = kwargs.pop("verbose", 1)
-    model = AlgoClass(policy, env, verbose=verbose, **kwargs)
+    model = AlgoClass(policy, train_env, verbose=verbose, **kwargs)
     model.learn(total_timesteps=total_timesteps)
     return model
 
@@ -909,7 +929,7 @@ def parse_args():
         "--workers",
         type=int,
         default=1,
-        help="Parallel workers for cloud batch subprocess orchestration.",
+        help="Number of parallel reactions (subprocesses) in --cloud-batch. Use 1 on a single GPU; use more only on multi-GPU nodes.",
     )
     parser.add_argument(
         "--graphs-dir",
@@ -921,6 +941,12 @@ def parse_args():
         type=int,
         default=30,
         help="Random trials used for evaluate-RL baseline.",
+    )
+    parser.add_argument(
+        "--n-envs",
+        type=int,
+        default=1,
+        help="Vectorized env count per algorithm training run (1 keeps current behavior).",
     )
     parser.add_argument(
         "--emit-artifacts",
@@ -1021,6 +1047,7 @@ def _process_single_row(
     emit_artifacts,
     graphs_root,
     n_random,
+    n_envs,
 ):
     graph_data, model = _build_row_model_and_graph(
         row=row,
@@ -1042,14 +1069,17 @@ def _process_single_row(
         reaction_dir.mkdir(parents=True, exist_ok=True)
 
     for algorithm in algo_keys:
-        env = DielsAlderOptEnv(
-            graph_data=graph_data,
-            model=model,
-            ts_mean=ts_mean,
-            ts_std=ts_std,
-            device=device,
-            max_steps=max_steps,
-        )
+        def _make_env():
+            return DielsAlderOptEnv(
+                graph_data=graph_data,
+                model=model,
+                ts_mean=ts_mean,
+                ts_std=ts_std,
+                device=device,
+                max_steps=max_steps,
+            )
+
+        env = _make_env()
         total_timesteps = RL_TIMESTEPS[algorithm]
         algo_log_dir = logs_root / f"reaction_{row_idx}" / algorithm
         rl_model = run_rl_optimization(
@@ -1057,6 +1087,8 @@ def _process_single_row(
             algorithm=algorithm,
             total_timesteps=total_timesteps,
             log_dir=str(algo_log_dir),
+            n_envs=n_envs,
+            env_builder=_make_env if n_envs > 1 else None,
         )
 
         save_path = save_dir / f"{model_name}_{algorithm}_row{row_idx}"
@@ -1169,6 +1201,8 @@ def _build_row_subprocess_command(args, row_idx: int):
         args.graphs_dir,
         "--n-random",
         str(args.n_random),
+        "--n-envs",
+        str(args.n_envs),
         "--emit-artifacts",
     ]
     if args.model_path:
@@ -1181,10 +1215,22 @@ def _build_row_subprocess_command(args, row_idx: int):
 def _run_cloud_batch_subprocesses(args, row_indices):
     row_indices = list(row_indices)
     workers = max(1, int(args.workers))
+    try:
+        n_gpu = torch.cuda.device_count()
+    except Exception:
+        n_gpu = 0
+    gpu_assign_lock = threading.Lock()
+    gpu_assign_counter = [0]  # mutable so closure can update
 
     def _run_row(row_idx: int):
+        env = os.environ.copy()
+        if n_gpu > 0 and args.device != "cpu":
+            with gpu_assign_lock:
+                gpu_id = gpu_assign_counter[0] % n_gpu
+                gpu_assign_counter[0] += 1
+            env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         cmd = _build_row_subprocess_command(args, row_idx)
-        proc = subprocess.run(cmd, text=True, capture_output=True)
+        proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
         return row_idx, proc.returncode, proc.stdout, proc.stderr
 
     failures = []
@@ -1278,10 +1324,15 @@ def main():
 
     if args.cloud_batch and args.workers > 1:
         if device.type == "cuda":
-            print(
-                "CUDA device detected: consider workers=1 for one GPU, "
-                "or set workers to available GPUs for multi-GPU nodes."
-            )
+            try:
+                n_gpu = torch.cuda.device_count()
+            except Exception:
+                n_gpu = 1
+            if n_gpu < args.workers:
+                print(
+                    f"Warning: --workers={args.workers} but only {n_gpu} GPU(s) available. "
+                    "Use --workers=1 on a single-GPU machine to avoid contention; multiple workers are for multi-GPU nodes."
+                )
         _run_cloud_batch_subprocesses(args, row_indices)
         results = _collect_artifact_row_results(graphs_root, row_indices)
     else:
@@ -1306,6 +1357,7 @@ def main():
                 emit_artifacts=emit_artifacts,
                 graphs_root=graphs_root,
                 n_random=args.n_random,
+                n_envs=args.n_envs,
             )
             results.extend(row_results)
             if args.plot and row_idx == row_indices[0] and row_results:
